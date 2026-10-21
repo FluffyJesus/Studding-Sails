@@ -11,7 +11,7 @@ namespace StuddingSails
     {
         public const string GUID = "fluffyjesus.sailwind.studdingsails";
         public const string NAME = "Studding Sails";
-        public const string VERSION = "1.2.0";
+        public const string VERSION = "1.3.1";
 
         internal static ManualLogSource Log;
 
