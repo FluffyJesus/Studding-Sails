@@ -1,52 +1,67 @@
 # Studding Sails
 
-A mod for **Sailwind** that adds studding sails to square sails: extra canvas set on booms beyond the ends of the yards, for more sail area in fair winds.
+A mod for **Sailwind** (BepInEx 5) that adds studding sails to square sails: extra canvas on either side of a sail for more speed in fair winds. They are rigged the way real ships did it.
 
-<img width="1809" height="1233" alt="image" src="https://github.com/user-attachments/assets/5ce50b96-1d89-4f24-9c9d-974edb834b53" />
+<img width="1712" height="1219" alt="image" src="https://github.com/user-attachments/assets/9666ede5-e4cf-45e5-9390-a7cc4f5640ff" />
 
-## Features
 
-- **Bought at the shipyard.** Square sails get a **Studding: On/Off** button, plus **Studding +** / **Studding −** to change the width (50–200%). The price scales with the width.
-- **Procedural shape.** Each studding sail is generated from the sail it belongs to:
-  - the **lowest** one is a right triangle, its clew tied to the clew of the sail;
-  - the **upper** ones are trapezoids, spread between their own boom and the studding boom of the yard below;
-  - they grow with the width of the sail.
-- **Real cloth.** They use Unity cloth with the same wind and damping as the vanilla sails, so they billow, sag and luff together with them.
-- **Same canvas.** They copy the material, texture and colour of their sail, with the seams laid out to match.
-- **Rigged.** Booms lie on top of the yards. Corners are lashed with blocks, the lower corners are sheeted to the yard below, and halyards lead to the yard above or to the masthead.
-- **Reefing.** Studding sails are set and taken in together with their sail. When it is furled, a furled bundle stays on the boom.
-- **Thrust.** Their area is added to the parent sail's power, so they do help in fair winds. Adjustable, or 0 for looks only.
+## How it works
+
+- **Buy them at the shipyard.** Select a square sail and press **Studding: On**. The price grows with the studding sail width.
+- **Set them with winches.** Every mast with studding sails gets two winches, one for each side. Crank a winch and:
+  1. a boom runs out along the yard below;
+  2. the studding sail is hoisted on its own small yard up to the end of the main yard, and the canvas opens.
+- **Steer with them.** Set studding sails on one side only and the boat turns. Set them on both sides for straight-line speed. They work even when the main sail is furled.
+- **Alive in the wind.** The studding sail yard swings on its rope, the canvas billows, the sheets lean with it.
+- **Matches your boat.** The canvas takes the sail's cloth and colour, the spars the yard's wood.
 
 ## Controls
 
-| Key | Action |
+| Where | What |
 |---|---|
-| **L** | Set / stow all studding sails and booms on the boat you are on |
-| **F8** | Tuning window (boom overlap, gap, cloth fullness, edge slack, ropes) |
+| Shipyard: **Studding On / Off** | Add or remove studding sails on the selected sail |
+| Shipyard: **Studding + / −** | Wider or narrower studding sails |
+| Shipyard: **Yardarm + / −** | Longer or shorter yard ends that carry the studding sails |
+| Shipyard: **Foot out / in** | Move the inner lower corner of a studding sail outwards or inwards |
+| Winches at the mast | Set and take in the studding sails, port and starboard separately |
+| **L** | Show or hide all studding sails on your boat |
+| **F8** | Tuning window for the looks |
 
-Both keys can be changed in the config.
+## Settings
+
+In `BepInEx/config/fluffyjesus.sailwind.studdingsails.cfg`. The visual ones can also be changed live in the **F8** window.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `Enabled` | true | Offer studding sails at the shipyard |
+| `PriceMultiplier` | 0.35 | Studding sail price as a share of the sail price |
+| `ThrustMultiplier` | 1 | How hard studding sails pull (0 = looks only) |
+| `TurnMultiplier` | 1 | How strongly one-sided studding sails turn the boat (0 = not at all) |
+| `UseWinch` | true | Off: studding sails simply follow their sail, and **L** sets / stows them |
+| `ToggleKey` / `WindowKey` | L / F8 | Keys |
+| `VanillaBoats` | vanilla boat list | Boats whose winches stand with the mast's other winches; on all others they are pinned to the mast |
+| `WinchOffsetX/Y/Z` | 0 | Nudge the winch if it overlaps something |
+| `HeadOverlap` | 0.2 | How far a studding sail overlaps its sail (when the yard length is automatic) |
+| `HalyardLength` | 0.3 | Length of the rope the studding sail yard hangs on: longer swings slower and further |
+| `SwingStrength` | 5 | How much the wind swings the studding sail yard (0 = it hangs still) |
+| `FootLift` | 0.5 | Gap between the studding sail's foot and the boom below |
+| `LengthSlack` / `Belly` / `SideSlack` / `HemSlack` | 0.14 / 0.005 / 0.01 / 0.1 | Spare cloth: how loose the canvas hangs |
+| `BoomOverlapOnYard` | 0.2 | How far the booms lie along the yard |
+| `BoomOffsetZ` / `HeadOffsetZ` | 0 / 0 | Move booms or studding sail heads fore and aft |
+| `UseSailTexture` | true | Use the sail's own cloth (off = plain canvas) |
+| `ShowRopes` | true | Show the ropes |
 
 ## Installation
 
 1. Install [BepInEx 5](https://github.com/BepInEx/BepInEx) for Sailwind.
-2. Put `StuddingSails` into `Sailwind/BepInEx/plugins`.
-
-## Configuration
-
-`BepInEx/config/fluffyjesus.sailwind.studdingsails.cfg`:
-
-- **[Studding]:** enable the shipyard option, price multiplier, thrust multiplier, keys.
-- **[Visuals]:** the same settings as in the F8 window, plus the sail texture and ropes toggles.
+2. Put `StuddingSails` into `Sailwind/BepInEx/plugins/StuddingSails/`.
 
 ## Compatibility
 
-- **ShipyardExpansion:** sail textures chosen with it are picked up automatically.
-- **Saves:** the studding sail flag and width are stored in a field of the sail save data that vanilla does not use. Without the mod, such a save loads as ordinary sails.
+- **Topsail Crossyard** and **ShipyardExpansion**: work together.
+- **Modded boats**: supported; the winches are pinned to the masts.
+- **Saves**: older saves load fine. Without the mod, a save loads with plain sails.
 
 ## A bit of history
 
-Studding sails (pronounced *"stuns'ls"*) were the light-weather extensions of square-rigged ships from the 16th to the late 19th century. Light booms were run out along the yards, and narrow sails were hoisted on them beyond the leeches of the courses, topsails and topgallants. In a fair breeze this added a large share of extra canvas.
-
-The lowest ones, set outside the courses, were often triangular or were spread by a boom swung out from the ship's side. The upper ones were named after the sail they extended: topmast and topgallant studding sails.
-
-Setting and taking them in was laborious, and they were used only with the wind from astern or on the quarter. Clippers and men-of-war carried them to the end of the age of sail, and they disappeared with the coming of steam and of the simpler rigs of the last sailing ships.
+Studding sails (pronounced *"stuns'ls"*) were the light-weather sails of square-rigged ships from the 16th to the late 19th century. Booms were run out along the yards, and narrow sails, each on a small yard of its own, were hoisted beyond the edges of the main sails. They took a lot of work to set and were used only with the wind from behind, but they added a great deal of canvas. Clippers and men-of-war carried them to the end of the age of sail.
