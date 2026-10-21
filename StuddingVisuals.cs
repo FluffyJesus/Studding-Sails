@@ -2178,23 +2178,10 @@ namespace StuddingSails
         private void TryFitUv()
         {
             if ((uvFitted && !uvProvisional) || !useSailTexture || curInfo == null) return;
-            if (sail.currentUnroll < 0.97f)
-            {
-                // the sail has not been set yet (e.g. fresh from the shipyard): use the layout fitted on its
-                // rest-pose mesh for now, so the studding sails already carry the sail's cloth
-                if (!uvFitted && curInfo.UvOk)
-                {
-                    uUw = curInfo.UvUw; uUh = curInfo.UvUh; uU0 = curInfo.UvU0;
-                    uVw = curInfo.UvVw; uVh = curInfo.UvVh; uV0 = curInfo.UvV0;
-                    uvTop = curInfo.TopU; uvBot = curInfo.BottomU;
-                    uvEdge = curInfo.TopHalf > 0.3f ? curInfo.TopHalf : curInfo.Half;
-                    uvFitted = true;
-                    uvProvisional = true;
-                    uvNote = "provisional: rest-pose fit (" + curInfo.UvNote + ")";
-                    ApplyUvToPanels();
-                }
-                return;
-            }
+            // the sail has not been set yet (e.g. fresh from the shipyard): its rest-pose UV layout came out
+            // turned across the canvas, so until it is set the studding sails wear the built-in canvas in the
+            // sail's colour (see Build / SyncColor), and the real cloth layout is fitted once the sail is set
+            if (sail.currentUnroll < 0.97f) return;
 
             var smr = parentRenderer as SkinnedMeshRenderer;
             if (smr == null || smr.sharedMesh == null) { useSailTexture = false; return; }
