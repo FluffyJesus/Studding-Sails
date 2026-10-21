@@ -6,11 +6,12 @@ using UnityEngine;
 namespace StuddingSails
 {
     [BepInPlugin(GUID, NAME, VERSION)]
+    [BepInDependency("fluffyjesus.sailwind.topsailyards", BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
         public const string GUID = "fluffyjesus.sailwind.studdingsails";
         public const string NAME = "Studding Sails";
-        public const string VERSION = "1.0.0";
+        public const string VERSION = "1.2.0";
 
         internal static ManualLogSource Log;
 

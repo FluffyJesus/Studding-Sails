@@ -60,6 +60,11 @@ namespace StuddingSails
             Slider("Gap from the sail, m", Studding.PanelGap, 0f, 1f);
             Slider("Height without a boom below (fraction of sail)", Studding.PanelHeightRatio, 0.3f, 1f);
             Slider("Boom fore/aft offset, m", Studding.BoomOffsetZ, -0.5f, 0.5f);
+            Slider("Head lap over the sail (fraction of width)", Studding.HeadOverlap, 0f, 0.5f);
+            Slider("Head fore/aft offset, m", Studding.HeadOffsetZ, -0.8f, 0.8f);
+            Slider("Foot above the boom below (sheets), m", Studding.FootLift, 0.1f, 2f);
+            Slider("Halyard length (pendulum), m", Studding.HalyardLength, 0.2f, 2f);
+            Slider("Swing in the wind, deg per m/s", Studding.SwingStrength, 0f, 6f);
 
             GUILayout.Space(6f);
             GUILayout.Label("Cloth");

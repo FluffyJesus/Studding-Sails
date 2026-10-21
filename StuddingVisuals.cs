@@ -25,6 +25,12 @@ namespace StuddingSails
 
         public float Half;      // half the yard length
         public float Radius;    // yard radius
+        public float TopOffset; // height of the top of the yard above its axis (flattened yards are lower)
+        public Vector3 YardScale; // yard lossy scale at measure time (ShipyardExpansion rescales yards)
+        public float EndUp, EndN; // half-height and half-depth of the yard at its ends (flattened yards are lower)
+        public Color Tone = new Color(0.30f, 0.22f, 0.17f); // average colour of the yard as textured
+        public Vector2[] EndUv;   // the yard's texture coordinates around its end, by angle (StuddingMeshes.SparSeg bins)
+        public Vector2[] EndUv2;  // the same for its second UV set (the paint/detail maps may use it), or null
 
         public float TopU;      // canvas top relative to the yard centre (along Up)
         public float BottomU;   // canvas bottom (negative)
@@ -56,7 +62,7 @@ namespace StuddingSails
 
         private static float KeyOf(Sail sail)
         {
-            try { return sail.GetScaleY() * 7.31f + sail.GetScaleZ() * 3.17f; }
+            try { return sail.GetScaleY() * 7.31f + sail.GetScaleZ() * 3.17f + sail.GetScaledHeight() * 1.13f; }
             catch (Exception) { return 0f; }
         }
 
@@ -66,7 +72,8 @@ namespace StuddingSails
             YardInfo info;
             if (cache.TryGetValue(sail, out info))
             {
-                if (info.Valid && info.Yard != null && Mathf.Abs(info.Key - key) < 0.0005f) return info;
+                if (info.Valid && info.Yard != null && Mathf.Abs(info.Key - key) < 0.0005f &&
+                    (info.Yard.lossyScale - info.YardScale).sqrMagnitude < 1e-6f) return info;
                 if (!info.Valid && Time.time < info.NextTry) return info;
             }
 
@@ -102,6 +109,148 @@ namespace StuddingSails
             }
 
             return tips.Tip[side];
+        }
+
+        /// <summary>Average colour of the yard: its texture sampled at its mesh UVs, times the material colour.</summary>
+        /// <summary>Main texture set through the renderer's property block, if any (for the log).</summary>
+        /// <summary>A texture the yard is drawn with: property block main texture, main texture, detail albedo.</summary>
+        internal static Texture AnyTexture(Material m, Renderer r)
+        {
+            try
+            {
+                if (r != null)
+                {
+                    var mpb = new MaterialPropertyBlock();
+                    r.GetPropertyBlock(mpb);
+                    if (!mpb.isEmpty)
+                    {
+                        Texture bt = mpb.GetTexture("_MainTex");
+                        if (bt != null) return bt;
+                    }
+                }
+                if (m == null) return null;
+                if (m.mainTexture != null) return m.mainTexture;
+                if (m.HasProperty("_DetailAlbedoMap") && m.GetTexture("_DetailAlbedoMap") != null) return m.GetTexture("_DetailAlbedoMap");
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        private static readonly Dictionary<Texture, Vector2> dominantUv = new Dictionary<Texture, Vector2>();
+
+        /// <summary>
+        /// Texture coordinates of the most common colour of a texture (a plain paint filling most of an atlas).
+        /// The texture need not be readable: it is drawn into a small render texture and read back from there,
+        /// once per texture. The point taken is the one deepest inside a patch of that colour.
+        /// </summary>
+        internal static bool DominantUv(Texture tex, out Vector2 uv)
+        {
+            uv = new Vector2(0.5f, 0.5f);
+            if (tex == null) return false;
+            if (dominantUv.TryGetValue(tex, out uv)) return true;
+
+            const int n = 64;
+            RenderTexture rt = null;
+            RenderTexture prev = RenderTexture.active;
+            Color32[] px;
+            try
+            {
+                rt = RenderTexture.GetTemporary(n, n, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(tex, rt);
+                RenderTexture.active = rt;
+                var t2 = new Texture2D(n, n, TextureFormat.RGBA32, false);
+                t2.ReadPixels(new Rect(0, 0, n, n), 0, 0);
+                t2.Apply();
+                px = t2.GetPixels32();
+                UnityEngine.Object.Destroy(t2);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+            finally
+            {
+                RenderTexture.active = prev;
+                if (rt != null) RenderTexture.ReleaseTemporary(rt);
+            }
+
+            // most common colour, 4 bits per channel
+            var keys = new int[px.Length];
+            var hist = new int[4096];
+            for (int i = 0; i < px.Length; i++)
+            {
+                Color32 c = px[i];
+                keys[i] = ((c.r >> 4) << 8) | ((c.g >> 4) << 4) | (c.b >> 4);
+                hist[keys[i]]++;
+            }
+            int best = 0;
+            for (int k = 1; k < hist.Length; k++) if (hist[k] > hist[best]) best = k;
+
+            // the pixel of that colour with the most same-coloured pixels around it (3 px radius)
+            int bestI = -1, bestN = -1;
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++)
+                {
+                    if (keys[y * n + x] != best) continue;
+                    int cnt = 0;
+                    for (int dy = -3; dy <= 3; dy++)
+                        for (int dx = -3; dx <= 3; dx++)
+                        {
+                            int xx = x + dx, yy = y + dy;
+                            if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue;
+                            if (keys[yy * n + xx] == best) cnt++;
+                        }
+                    if (cnt > bestN) { bestN = cnt; bestI = y * n + x; }
+                }
+            if (bestI < 0) return false;
+
+            uv = new Vector2((bestI % n + 0.5f) / n, (bestI / n + 0.5f) / n);
+            dominantUv[tex] = uv;
+            return true;
+        }
+
+        internal static string BlockTex(Renderer r)
+        {
+            try
+            {
+                if (r == null) return "none";
+                var mpb = new MaterialPropertyBlock();
+                r.GetPropertyBlock(mpb);
+                if (mpb.isEmpty) return "none";
+                Texture t = mpb.GetTexture("_MainTex");
+                return t != null ? t.name : "none";
+            }
+            catch (Exception) { return "?"; }
+        }
+
+        private static Color YardTone(Renderer r, Mesh mesh, Color fallback)
+        {
+            try
+            {
+                Material m = r != null ? r.sharedMaterial : null;
+                if (m == null) return fallback;
+                Color tint = m.HasProperty("_Color") ? m.color : Color.white;
+                var tex = m.mainTexture as Texture2D;
+                Vector2[] uv = mesh.isReadable ? mesh.uv : null;
+                if (tex == null || !tex.isReadable || uv == null || uv.Length == 0) return fallback;
+
+                Vector2 sc = m.mainTextureScale, of = m.mainTextureOffset;
+                Color sum = Color.clear;
+                int n = 0, step = Mathf.Max(1, uv.Length / 400);
+                for (int i = 0; i < uv.Length; i += step)
+                {
+                    Vector2 u = new Vector2(uv[i].x * sc.x + of.x, uv[i].y * sc.y + of.y);
+                    sum += tex.GetPixelBilinear(u.x, u.y);
+                    n++;
+                }
+                if (n == 0) return fallback;
+                Color c = sum / n;
+                return new Color(c.r * tint.r, c.g * tint.g, c.b * tint.b, 1f);
+            }
+            catch (Exception)
+            {
+                return fallback;
+            }
         }
 
         private static YardInfo Measure(Sail sail, float key)
@@ -154,6 +303,19 @@ namespace StuddingSails
                 Vector3 normal = Vector3.Cross(along, up).normalized;
 
                 float thick = (dims[(axis + 1) % 3] + dims[(axis + 2) % 3]) * 0.25f;
+                float endUp = -1f, endN = -1f;
+                Vector2[] endUv = null, endUv2 = null;
+                Color tone = info.Tone;
+
+                // fallback for the top of the yard: half of the bounds extent along "up" (non-long axes)
+                float topOffset = 0f;
+                for (int a2 = 0; a2 < 3; a2++)
+                {
+                    if (a2 == axis) continue;
+                    Vector3 av = a2 == 0 ? Vector3.right : (a2 == 1 ? Vector3.up : Vector3.forward);
+                    Vector3 v3 = st.InverseTransformVector(yard.TransformVector(av * b.extents[a2]));
+                    topOffset += Mathf.Abs(Vector3.Dot(v3, up));
+                }
 
                 // Refine the yard axis from the vertices of its ends: the parrel and fittings shift the bounds centre
                 try
@@ -182,6 +344,62 @@ namespace StuddingSails
                             for (int i = 0; i < perps.Count; i++) rSum += (perps[i] - off).magnitude;
                             center += off;
                             thick = rSum / cnt;
+
+                            float top = 0f;
+                            for (int i = 0; i < perps.Count; i++) top = Mathf.Max(top, Vector3.Dot(perps[i] - off, up));
+                            topOffset = top;
+
+                            // cross-section at the very ends (the yardarms): our yardarm extensions continue it
+                            float eu = 0f, en = 0f;
+                            int ec = 0;
+                            Vector3 nrm = Vector3.Cross(along, up).normalized;
+                            Vector2[] yuv = null;
+                            Vector3[] ynm = null;
+                            try { yuv = mesh.uv; ynm = mesh.normals; } catch (Exception) { }
+                            if (yuv != null && yuv.Length != yv.Length) yuv = null;
+                            if (ynm != null && ynm.Length != yv.Length) ynm = null;
+                            int seg = StuddingMeshes.SparSeg;
+                            // per angle bin, all side UVs; the bin takes the average of its biggest cluster (a
+                            // plain average is right in tone but at a UV seam lands between the two islands,
+                            // on some unrelated, lighter part of the texture)
+                            var uvBins = new List<Vector2>[seg];
+                            var uv2Bins = new List<Vector2>[seg];
+                            for (int q = 0; q < seg; q++) { uvBins[q] = new List<Vector2>(); uv2Bins[q] = new List<Vector2>(); }
+                            Vector2[] yuv2 = null;
+                            try { yuv2 = mesh.uv2; } catch (Exception) { }
+                            if (yuv2 != null && yuv2.Length != yv.Length) yuv2 = null;
+                            for (int i = 0; i < yv.Length; i++)
+                            {
+                                Vector3 l = st.InverseTransformPoint(yard.TransformPoint(yv[i])) - center;
+                                float a = Vector3.Dot(l, along);
+                                if (Mathf.Abs(a) < half * 0.9f) continue;
+                                Vector3 perp = l - along * a; // centre already moved onto the axis
+                                float pu = Vector3.Dot(perp, up), pn = Vector3.Dot(perp, nrm);
+                                eu = Mathf.Max(eu, Mathf.Abs(pu));
+                                en = Mathf.Max(en, Mathf.Abs(pn));
+                                ec++;
+                                if (yuv != null && Mathf.Abs(a) > half * 0.75f && Mathf.Abs(a) < half * 0.97f)
+                                {
+                                    // side faces only: end caps carry end-grain UVs
+                                    if (ynm != null)
+                                    {
+                                        Vector3 nw = st.InverseTransformDirection(yard.TransformDirection(ynm[i])).normalized;
+                                        if (Mathf.Abs(Vector3.Dot(nw, along)) > 0.5f) continue;
+                                    }
+                                    // angle as our spar mesh measures it: cos -> up, sin -> canvas normal
+                                    float ang = Mathf.Atan2(pn, pu);
+                                    if (ang < 0f) ang += Mathf.PI * 2f;
+                                    int bin = Mathf.RoundToInt(ang / (Mathf.PI * 2f) * seg) % seg;
+                                    uvBins[bin].Add(yuv[i]);
+                                    if (yuv2 != null) uv2Bins[bin].Add(yuv2[i]);
+                                }
+                            }
+                            if (ec >= 4 && eu > 0.005f && en > 0.005f) { endUp = eu; endN = en; }
+                            // One texture coordinate for the whole spar: the average of all the yard's side UVs at
+                            // its end. Averaging gave the right tone; averaging per angle striped the spars, because
+                            // at a UV seam the two sides of the seam averaged to some unrelated part of the texture.
+                            endUv = StuddingMeshes.UniformRing(uvBins);
+                            if (yuv2 != null) endUv2 = StuddingMeshes.UniformRing(uv2Bins);
                         }
                     }
                 }
@@ -189,6 +407,10 @@ namespace StuddingSails
                 {
                     // mesh not readable: keep the bounds centre
                 }
+
+                // the yard's colour as it is textured: its texture averaged at its own UVs
+                // (a shared atlas looks patchy on our spars, so they get their own wood in this tone)
+                tone = YardTone(yardRend, mesh, tone);
 
                 // Canvas size from the rest-pose vertices of the sail mesh
                 float height = sail.GetScaledHeight() + 0.28f;
@@ -262,6 +484,13 @@ namespace StuddingSails
                 info.Normal = normal;
                 info.Half = half;
                 info.Radius = Mathf.Clamp(thick * 0.95f, 0.03f, 0.12f);
+                info.TopOffset = topOffset > 0.005f ? Mathf.Clamp(topOffset, 0.005f, 0.2f) : info.Radius;
+                info.YardScale = yard.lossyScale;
+                info.EndUp = endUp > 0f ? Mathf.Clamp(endUp, 0.01f, 0.2f) : info.TopOffset;
+                info.EndN = endN > 0f ? Mathf.Clamp(endN, 0.01f, 0.2f) : info.Radius;
+                info.Tone = tone;
+                info.EndUv = endUv;
+                info.EndUv2 = endUv2;
                 info.TopU = topU;
                 info.BottomU = bottomU;
                 info.TopHalf = topHalf;
@@ -279,6 +508,19 @@ namespace StuddingSails
                     info.UvNote += " (assumed standard layout)";
                 }
 
+                // which renderer is taken as the yard and what our spars copy from it (once per sail and size)
+                {
+                    Material ym = yardRend != null ? yardRend.sharedMaterial : null;
+                    Texture yt = ym != null ? ym.mainTexture : null;
+                    Plugin.Log.LogInfo("[Studding] " + sail.name + ": yard '" + yard.name + "' mesh '" + mesh.name +
+                        "' material '" + (ym != null ? ym.name : "none") + "' texture '" + (yt != null ? yt.name : "none") +
+                        "' readable=" + (yt is Texture2D && ((Texture2D)yt).isReadable) + ", mesh readable=" + mesh.isReadable +
+                        ", ring UVs " + (endUv != null ? "found" : "not found") + (endUv2 != null ? " (+uv2)" : "") +
+                        ", keywords [" + (ym != null ? string.Join(",", ym.shaderKeywords) : "") + "]" +
+                        ", block texture '" + BlockTex(yardRend) + "', detail '" +
+                        (ym != null && ym.HasProperty("_DetailAlbedoMap") && ym.GetTexture("_DetailAlbedoMap") != null ? ym.GetTexture("_DetailAlbedoMap").name : "none") +
+                        "', tone " + tone);
+                }
                 if (Studding.VerboseLog.Value)
                 {
                     Plugin.Log.LogInfo(string.Format(
@@ -424,11 +666,101 @@ namespace StuddingSails
         private static Mesh boom;
 
         /// <summary>Cylinder along X: length 1 (-0.5..0.5), radius 1, tapering towards +X.</summary>
+        internal const int SparSeg = 10;
+
+        /// <summary>Average of the largest group of points lying within 0.06 of each other.</summary>
+        /// <summary>All the points of all bins averaged, the same value for every bin. Null if there are none.</summary>
+        internal static Vector2[] UniformRing(List<Vector2>[] bins)
+        {
+            Vector2 sum = Vector2.zero;
+            int n = 0;
+            foreach (var b in bins) foreach (var p in b) { sum += p; n++; }
+            if (n == 0) return null;
+            var r = new Vector2[bins.Length];
+            for (int i = 0; i < r.Length; i++) r[i] = sum / n;
+            return r;
+        }
+
+        internal static bool MainCluster(List<Vector2> pts, out Vector2 centre)
+        {
+            centre = Vector2.zero;
+            if (pts == null || pts.Count == 0) return false;
+            const float r2 = 0.06f * 0.06f;
+            int bestN = -1;
+            Vector2 bestC = pts[0];
+            for (int i = 0; i < pts.Count; i++)
+            {
+                int n = 0;
+                Vector2 sum = Vector2.zero;
+                for (int j = 0; j < pts.Count; j++)
+                    if ((pts[j] - pts[i]).sqrMagnitude <= r2) { n++; sum += pts[j]; }
+                if (n > bestN) { bestN = n; bestC = sum / n; }
+            }
+            centre = bestC;
+            return true;
+        }
+
+        /// <summary>Average texture coordinates per angle bin; empty bins take the nearest filled one. Null if none.</summary>
+        internal static Vector2[] FillRing(Vector2[] sum, int[] cnt)
+        {
+            int n = sum.Length, filled = 0;
+            var r = new Vector2[n];
+            var ok = new bool[n];
+            for (int i = 0; i < n; i++) if (cnt[i] > 0) { r[i] = sum[i] / cnt[i]; ok[i] = true; filled++; }
+            if (filled == 0) return null;
+            for (int i = 0; i < n; i++)
+            {
+                if (ok[i]) continue;
+                for (int d = 1; d < n; d++)
+                {
+                    int a = (i + d) % n, b = (i - d + n) % n;
+                    if (ok[a]) { r[i] = r[a]; break; }
+                    if (ok[b]) { r[i] = r[b]; break; }
+                }
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Spar textured like a given yard: every ring takes the yard's own texture coordinates at the same
+        /// angle around it (measured at the yard's end), so the spar shows exactly the yard's wood.
+        /// </summary>
+        internal static Mesh Spar(Vector2[] ringUv, Vector2[] ringUv2 = null)
+        {
+            if (ringUv == null || ringUv.Length != SparSeg) return Boom();
+            Mesh m = BuildSpar(ringUv);
+            if (ringUv2 != null && ringUv2.Length == SparSeg)
+            {
+                // second UV set, same layout as the first: every vertex takes its angle bin's value
+                var uv = new List<Vector2>();
+                m.GetUVs(0, uv);
+                var uv2 = new List<Vector2>(uv.Count);
+                for (int i = 0; i < uv.Count; i++)
+                {
+                    int bin = 0;
+                    float bd = float.MaxValue;
+                    for (int q = 0; q < SparSeg; q++)
+                    {
+                        float d = (ringUv[q] - uv[i]).sqrMagnitude;
+                        if (d < bd) { bd = d; bin = q; }
+                    }
+                    uv2.Add(ringUv2[bin]);
+                }
+                m.SetUVs(1, uv2);
+            }
+            return m;
+        }
+
         internal static Mesh Boom()
         {
             if (boom != null) return boom;
+            boom = BuildSpar(null);
+            return boom;
+        }
 
-            const int seg = 10, rings = 6;
+        private static Mesh BuildSpar(Vector2[] ringUv)
+        {
+            const int seg = SparSeg, rings = 6;
             var v = new List<Vector3>();
             var uv = new List<Vector2>();
             var t = new List<int>();
@@ -442,7 +774,7 @@ namespace StuddingSails
                 {
                     float a = j / (float)seg * Mathf.PI * 2f;
                     v.Add(new Vector3(x, r * Mathf.Cos(a), r * Mathf.Sin(a)));
-                    uv.Add(new Vector2(k, j / (float)seg));
+                    uv.Add(ringUv != null ? ringUv[j % seg] : new Vector2(k, j / (float)seg));
                 }
             }
 
@@ -462,13 +794,15 @@ namespace StuddingSails
                 float x = end == 0 ? -0.5f : 0.5f;
                 float r = end == 0 ? 1f : 0.7f;
                 int center = v.Count;
-                v.Add(new Vector3(x, 0f, 0f)); uv.Add(new Vector2(end, 0.5f));
+                Vector2 mid = new Vector2(end, 0.5f);
+                if (ringUv != null) { mid = Vector2.zero; foreach (var q in ringUv) mid += q; mid /= seg; }
+                v.Add(new Vector3(x, 0f, 0f)); uv.Add(mid);
                 int ring0 = v.Count;
                 for (int j = 0; j <= seg; j++)
                 {
                     float a = j / (float)seg * Mathf.PI * 2f;
                     v.Add(new Vector3(x, r * Mathf.Cos(a), r * Mathf.Sin(a)));
-                    uv.Add(new Vector2(end, j / (float)seg));
+                    uv.Add(ringUv != null ? ringUv[j % seg] : new Vector2(end, j / (float)seg));
                 }
                 for (int j = 0; j < seg; j++)
                 {
@@ -477,14 +811,14 @@ namespace StuddingSails
                 }
             }
 
-            boom = new Mesh();
-            boom.name = "studding_boom";
-            boom.SetVertices(v);
-            boom.SetUVs(0, uv);
-            boom.SetTriangles(t, 0);
-            boom.RecalculateNormals();
-            boom.RecalculateBounds();
-            return boom;
+            var mesh = new Mesh();
+            mesh.name = ringUv != null ? "studding_spar" : "studding_boom";
+            mesh.SetVertices(v);
+            mesh.SetUVs(0, uv);
+            mesh.SetTriangles(t, 0);
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            return mesh;
         }
 
         /// <summary>
@@ -497,7 +831,7 @@ namespace StuddingSails
 
         internal static float BuildGrid(Mesh m, float sign,
             float xInTop, float xOutTop, float xInBot, float xOutBot,
-            float yTop, float yBot, bool tri, int nu, int nv, float bulge, float belly = 0f)
+            float yTop, float yBot, bool tri, int nu, int nv, float bulge, float belly = 0f, float headZ = 0f)
         {
             // Slack on a free edge: at rest it is bowed into an arc longer than
             // the distance between the corners by "slack" (for an arc: length ~ chord * (1 + 8/3*(depth/chord)^2)).
@@ -506,10 +840,12 @@ namespace StuddingSails
             float hemK = tri ? 0f : Mathf.Sqrt(3f * Mathf.Max(0f, Studding.HemSlack.Value) / 8f);
             float hemDepth = (xOutBot - xInBot) * hemK;
 
-            // Side edges bow outwards by SideSlack (the inner one towards the parent sail, the outer one outboard).
-            float sideK = tri ? 0f : Mathf.Sqrt(3f * Mathf.Max(0f, Studding.SideSlack.Value) / 8f); // no slack on the triangle
+            // Side edges bow outwards by SideSlack (the inner one towards the parent sail, the outer one outboard;
+            // on the triangle the outer edge is the diagonal from the boom end down to the apex).
+            float sideK = Mathf.Sqrt(3f * Mathf.Max(0f, Studding.SideSlack.Value * (tri ? Studding.TriangleSlack.Value : 1f)) / 8f);
             float sideDepth = (yTop - yBot) * sideK;
-            float innerDepth = Mathf.Min(sideDepth, Studding.PanelGap.Value * 0.8f); // stay clear of the parent sail
+            // no slack on the inner edge of a four-sided studding sail: folding back it cut through its sail
+            float innerDepth = tri ? Mathf.Min(sideDepth, Studding.PanelGap.Value * 0.8f) : 0f;
 
             var v = new List<Vector3>();
             var uv = new List<Vector2>();
@@ -532,6 +868,8 @@ namespace StuddingSails
                     float z = bulge * Mathf.Sin(Mathf.PI * fv) * (0.7f + 0.3f * Mathf.Sin(Mathf.PI * fu));
                     // belly: slack across the width (fades out towards the head)
                     z += belly * Mathf.Sin(Mathf.PI * fu) * Mathf.Sqrt(fv);
+                    // the head hangs from the studding sail yard, off the sail plane; the foot is on the boom below
+                    z += headZ * (1f - fv);
                     float xx = x, yy = y;
 
                     // foot roach: upward arc at the foot, fading out above
@@ -793,7 +1131,15 @@ namespace StuddingSails
             public Transform TopBone, BotBone;
             public Vector3 BotRest;
 
-            public GameObject Roll;       // furled studding sail on the boom
+            public GameObject Roll;       // furled studding sail under its own yard
+            public Transform Slider;      // the boom on our yard (the base for the studding sail above); moved inboard when run in
+            public Transform Canvas;      // the studding sail itself: its yard, canvas and corners (does not slide)
+            public Transform Head;        // everything hanging on the halyard: swings about the yardarm block
+            public float Ang, AngVel;     // swing of the head, degrees (a damped pendulum driven by the wind)
+            public Transform HeadYard;    // the studding sail's own small yard along its head
+            public Transform HeadMid;     // middle of that yard: the halyard is made fast here
+            public Transform Arm;         // yardarm extension of our yard (studding sail yards are longer)
+            public Transform ArmTip;      // block at the yardarm: the halyard leads up to it
         }
 
         private sealed class RopeLink
@@ -811,13 +1157,37 @@ namespace StuddingSails
 
         private GameObject root;
         private Material[] woodMats;
+        private Mesh sparMesh;
+        private Material[] blockMats;
+
+        /// <summary>Blocks: the yard's shader with our wood texture, darker than the spars.</summary>
+        private Material[] BlockMats()
+        {
+            if (blockMats != null) return blockMats;
+            YardInfo info = curInfo != null ? curInfo : StuddingGeom.Get(sail);
+            Material src = info != null && info.YardRenderer != null ? info.YardRenderer.sharedMaterial : null;
+            Color tone = info != null ? info.Tone : new Color(0.3f, 0.22f, 0.17f);
+            Material m = src != null ? new Material(src) : new Material(Shader.Find("Standard"));
+            m.name = "StuddingBlockWood";
+            m.mainTexture = SparTexture(tone * 0.7f);
+            m.mainTextureScale = Vector2.one;
+            m.mainTextureOffset = Vector2.zero;
+            if (m.HasProperty("_Color")) m.color = Color.white;
+            if (m.HasProperty("_BumpMap")) { m.SetTexture("_BumpMap", null); m.DisableKeyword("_NORMALMAP"); }
+            if (m.HasProperty("_DetailAlbedoMap")) m.SetTexture("_DetailAlbedoMap", null);
+            blockMats = new[] { m };
+            return blockMats;
+        }
+        private bool woodTextured; // woodMats is the yard's own material: the spars carry the yard's UVs
         private Material clothMat;
         private Renderer parentRenderer;
+        private Renderer furledRend;
         private bool useSailTexture;
         private Material srcMat;
         private Texture srcTex;
         private YardInfo curInfo;
         private bool uvFitted;
+        private bool uvProvisional; // fitted on the rest-pose mesh while the sail was furled; refined once it is set
         private bool geomBaked;
         private float bakedBottomHalf, bakedBottomU;
         private string bakeNote = "not baked yet";
@@ -833,10 +1203,16 @@ namespace StuddingSails
 
         // canvas geometry with the sail fully set ("outboard positive" coordinates)
         private float gXInTop, gXOutTop, gXInBot, gXOutBot, gYTop, gYBot, gWidth;
+        private float gRetract;
+        private float gHeadZ, gPivotX, gDrop;
+        private readonly bool[] headStowed = new bool[2];
+        private float laidArm = -1f, laidAboveWidth, laidFoot, laidAboveFoot;
+        private readonly float[] sideK = new float[2];     // set fraction of each side's canvas
         private bool geomOk;
 
         private bool needBuild = true;
-        private bool panelsShown;
+        private bool panelsShown;                           // either side shown
+        private readonly bool[] sideShown = new bool[2];
         private float builtK = -1f;
         private bool builtTri;
         private float lastK = -1f, stableTime;
@@ -845,8 +1221,27 @@ namespace StuddingSails
         private Sail above, below;
         private float nextNeighbourCheck;
 
-        /// <summary>Studding sail canvas area (used for thrust).</summary>
+        /// <summary>Studding sail canvas area, both sides together (used for thrust).</summary>
         internal float Area;
+
+        /// <summary>
+        /// Set area of one side (0 port, 1 starboard) for thrust: the canvas area times how far it is set.
+        /// The first 30% of the winch only runs the boom out, the canvas (and so the area) starts after it.
+        /// </summary>
+        internal float SideArea(int s)
+        {
+            if (!Visible || !sideShown[s]) return 0f;
+            return Area * 0.5f * sideK[s];
+        }
+
+        /// <summary>Centre of one side's studding sail (fully set shape), world space.</summary>
+        internal Vector3 SideCenter(int s)
+        {
+            if (root == null) return sail.transform.position;
+            float sign = s == 0 ? -1f : 1f;
+            return root.transform.TransformPoint(new Vector3(sign * (gXInTop + gXOutTop + gXInBot + gXOutBot) * 0.25f,
+                                                             (gYTop + gYBot) * 0.5f, 0f));
+        }
 
         /// <summary>Rig shown (booms in place); the canvas may be furled.</summary>
         internal bool Visible;
@@ -856,11 +1251,18 @@ namespace StuddingSails
         {
             this.sail = sail;
             rigs[sail] = this;
+            if (Studding.VerboseLog.Value) Plugin.Log.LogInfo("[Studding] rig created for " + Studding.Describe(sail));
         }
 
         // ------------------------------------------------------------ lifecycle
 
-        internal void Tick(bool deployed)
+        /// <summary>
+        /// deploy: 0 = booms run in on the yard, 0..BoomPhase = booms run out, then the canvas is lowered.
+        /// </summary>
+        internal void Tick(float deploy) { Tick(deploy, deploy); }
+
+        /// <summary>Each side (0 port, 1 starboard) set by its own value.</summary>
+        internal void Tick(float deployL, float deployR)
         {
             YardInfo info = StuddingGeom.Get(sail);
             if (!info.Valid)
@@ -878,6 +1280,12 @@ namespace StuddingSails
                 nextNeighbourCheck = Time.time + 0.5f;
                 above = FindNeighbour(true);
                 below = FindNeighbour(false);
+
+                // the studding sail above changed width (or appeared / went): our boom is its base
+                float aw = above != null && Studding.IsOn(above) ? Studding.PanelWidth(above) : 0f;
+                if (Mathf.Abs(aw - laidAboveWidth) > 0.01f) laidOutKey = -9999f;
+                float af = above != null && Studding.IsOn(above) ? Studding.GetFootShift(above) : 0f;
+                if (Mathf.Abs(af - laidAboveFoot) > 0.001f) laidOutKey = -9999f;
 
                 bool tri = below == null || !Studding.IsOn(below); // no studding sails below: triangle
                 if (tri != triangle)
@@ -900,21 +1308,59 @@ namespace StuddingSails
 
             TryBakeGeometry();
             if (laidVersion != LayoutVersion || Mathf.Abs(laidOutKey - info.Key) > 0.0001f ||
-                Mathf.Abs(laidWidth - Studding.GetWidth(sail)) > 0.001f) Layout(info);
+                Mathf.Abs(laidWidth - Studding.GetWidth(sail)) > 0.001f ||
+                Mathf.Abs(laidArm - Studding.GetArm(sail)) > 0.001f ||
+                (!triangle && Mathf.Abs(laidFoot - Studding.GetFootShift(sail)) > 0.001f)) Layout(info);
 
             SyncColor();
-            UpdatePanels(deployed);
+            tickDeploy[0] = deployL;
+            tickDeploy[1] = deployR;
+            for (int s = 0; s < 2; s++)
+            {
+                // our boom is only the base for the studding sail above (its foot is sheeted to it): it runs
+                // out with that sail's winch; our own studding sail hangs from the yardarm instead
+                float boom = BoomDemandFromAbove(s) * BoomPhase;
+                boomDeploy[s] = boom;
+                float slide = Mathf.Clamp01(boom / BoomPhase);
+                tickCanvas[s] = Mathf.Clamp01((tickDeploy[s] - BoomPhase) / (1f - BoomPhase));
+                if (sides[s] == null || sides[s].Slider == null) continue;
+                float sign = s == 0 ? -1f : 1f;
+                sides[s].Slider.localPosition = new Vector3(-sign * gRetract * (1f - slide), 0f, 0f);
+            }
+
+            bool boomNeeded = above != null && Studding.IsOn(above);
+            for (int s = 0; s < 2; s++)
+                if (sides[s] != null && sides[s].Boom != null && sides[s].Boom.gameObject.activeSelf != boomNeeded)
+                    sides[s].Boom.gameObject.SetActive(boomNeeded);
+
+            UpdatePanels(tickCanvas, tickDeploy);
+            for (int s = 0; s < 2; s++) UpdateSwing(s);
 
             for (int s = 0; s < 2; s++)
             {
                 Side sd = sides[s];
                 if (sd.CoeffPending) ApplyCoefficients(sd);
                 if (!wasShown && sd.Cloth != null) sd.Cloth.ClearTransformMotion();
-                UpdateClothWind(sd);
+                UpdateClothWind(sd, s);
             }
             wasShown = true;
 
             UpdateRopes();
+        }
+
+        private const float BoomPhase = 0.3f; // first part of the winch: the boom runs out, no canvas yet
+        private readonly float[] tickDeploy = new float[2], tickCanvas = new float[2], boomDeploy = new float[2];
+
+        /// <summary>
+        /// How far the four-sided studding sail above needs our boom on side s (0..1): its foot is sheeted to
+        /// our boom end, so our boom runs out together with its boom.
+        /// </summary>
+        private float BoomDemandFromAbove(int s)
+        {
+            if (above == null || !Studding.IsOn(above)) return 0f;
+            StuddingRig r = Of(above);
+            if (r == null || !r.Visible || r.triangle || r.below != sail) return 0f;
+            return Mathf.Clamp01(r.tickDeploy[s] / BoomPhase);
         }
 
         internal void Hide()
@@ -931,8 +1377,11 @@ namespace StuddingSails
             if (root != null) UnityEngine.Object.Destroy(root);
             root = null;
             if (clothMat != null) UnityEngine.Object.Destroy(clothMat);
-            if (woodMats != null)
+            if (woodMats != null && !woodTextured) // the yard's own material is shared, never ours to destroy
                 foreach (var m in woodMats) if (m != null) UnityEngine.Object.Destroy(m);
+            if (blockMats != null)
+                foreach (var m in blockMats) if (m != null) UnityEngine.Object.Destroy(m);
+            blockMats = null;
             rigs.Remove(sail);
             StuddingGeom.Forget(sail);
         }
@@ -958,12 +1407,17 @@ namespace StuddingSails
             triangle = below == null || !Studding.IsOn(below); // no studding sails below: triangle
             nextNeighbourCheck = Time.time + 0.5f;
 
-            woodMats = MakeWoodMaterials(info.YardRenderer);
+            woodMats = MakeWoodMaterials(info);
+            sparMesh = info.EndUv != null && woodTextured ? StuddingMeshes.Spar(info.EndUv, info.EndUv2) : StuddingMeshes.Boom();
 
             parentRenderer = sail.cloth != null ? sail.cloth.GetComponent<SkinnedMeshRenderer>() : null;
             // built-in canvas until the sail material is taken (or if the sail UVs cannot be read)
             useSailTexture = Studding.UseSailTexture.Value;
-            clothMat = StuddingCanvas.Make(parentRenderer != null ? parentRenderer.sharedMaterial : null);
+            var reef0 = sail.GetComponent<ReefEffectAnimUniversal>();
+            furledRend = reef0 != null ? reef0.furledSail : null;
+            Color c0;
+            bool h0;
+            clothMat = StuddingCanvas.Make(SourceMat(out c0, out h0));
             SyncColor();
 
             var reef = sail.GetComponent<ReefEffectAnimUniversal>();
@@ -974,23 +1428,30 @@ namespace StuddingSails
                 var sd = new Side();
                 string tag = s == 0 ? "L" : "R";
 
-                sd.Boom = NewChild("Boom_" + tag, root.transform);
-                sd.Boom.gameObject.AddComponent<MeshFilter>().sharedMesh = StuddingMeshes.Boom();
-                var br = sd.Boom.gameObject.AddComponent<MeshRenderer>();
-                br.sharedMaterials = woodMats;
-                br.shadowCastingMode = ShadowCastingMode.On;
-                br.receiveShadows = true;
-                CopyPropertyBlock(info.YardRenderer, br);
+                // everything on this side lives under a slider: the boom runs out along the yard when set
+                sd.Slider = NewChild("Slide_" + tag, root.transform);
 
-                sd.BoomTip = NewChild("BoomTip_" + tag, root.transform);
-                sd.BoomInner = NewChild("BoomInner_" + tag, root.transform);
-                sd.SheetInner = NewChild("SheetInner_" + tag, root.transform);
-                sd.TopIn = NewChild("TopIn_" + tag, root.transform);
-                sd.TopOut = NewChild("TopOut_" + tag, root.transform);
-                sd.BotIn = NewChild("BotIn_" + tag, root.transform);
-                sd.BotOut = NewChild("BotOut_" + tag, root.transform);
+                sd.Boom = NewChild("Boom_" + tag, sd.Slider);
+                AttachWood(sd.Boom, info);
 
-                sd.Roll = MakeRoll(furled, "Roll_" + tag);
+                sd.BoomTip = NewChild("BoomTip_" + tag, sd.Slider);
+                sd.BoomInner = NewChild("BoomInner_" + tag, sd.Slider);
+                sd.SheetInner = NewChild("SheetInner_" + tag, sd.Slider);
+                // the studding sail: hoisted on its own yard by a halyard from the yardarm
+                sd.Canvas = NewChild("Canvas_" + tag, root.transform);
+                sd.Head = NewChild("Head_" + tag, sd.Canvas);
+                sd.TopIn = NewChild("TopIn_" + tag, sd.Head);
+                sd.TopOut = NewChild("TopOut_" + tag, sd.Head);
+                sd.BotIn = NewChild("BotIn_" + tag, sd.Canvas);
+                sd.BotOut = NewChild("BotOut_" + tag, sd.Canvas);
+                sd.HeadYard = Spar("HeadYard_" + tag, sd.Head, info.YardRenderer);
+                sd.HeadMid = NewChild("HeadMid_" + tag, sd.Head);
+
+                // yardarm extension: yards carrying studding sails are longer than plain ones
+                sd.Arm = Spar("YardArm_" + tag, root.transform, info.YardRenderer);
+                sd.ArmTip = NewChild("ArmTip_" + tag, root.transform);
+
+                sd.Roll = MakeRoll(furled, "Roll_" + tag, sd.Head);
 
                 sides[s] = sd;
             }
@@ -998,14 +1459,38 @@ namespace StuddingSails
             laidOutKey = -9999f;
         }
 
-        /// <summary>Clone of the vanilla furled sail (furledSail), shown on the boom when the studding sail is furled.</summary>
-        private GameObject MakeRoll(Renderer furled, string name)
+        /// <summary>A wooden spar (boom mesh, yard wood), placed by Layout.</summary>
+        private Transform Spar(string name, Transform parent, Renderer yardRend)
+        {
+            Transform t = NewChild(name, parent);
+            AttachWood(t, curInfo != null ? curInfo : StuddingGeom.Get(sail));
+            return t;
+        }
+
+        /// <summary>
+        /// Wood for a spar placed by Layout as a unit spar along X: our spar mesh, carrying the yard's texture
+        /// coordinates, with the yard's own material and property block. (The yard mesh itself cannot be used:
+        /// on some sails it has the yardarm cleats built in, which then turned up on every spar.)
+        /// </summary>
+        private void AttachWood(Transform t, YardInfo info)
+        {
+            Renderer yr = info != null ? info.YardRenderer : null;
+            t.gameObject.AddComponent<MeshFilter>().sharedMesh = sparMesh != null ? sparMesh : StuddingMeshes.Boom();
+            var fr = t.gameObject.AddComponent<MeshRenderer>();
+            fr.sharedMaterials = woodMats;
+            fr.shadowCastingMode = ShadowCastingMode.On;
+            fr.receiveShadows = true;
+            if (woodTextured) CopyPropertyBlock(yr, fr);
+        }
+
+        /// <summary>Clone of the vanilla furled sail (furledSail), shown under the studding sail yard when it is furled.</summary>
+        private GameObject MakeRoll(Renderer furled, string name, Transform parent)
         {
             if (furled == null) return null;
             Mesh mesh = StuddingGeom.MeshOf(furled.transform);
             if (mesh == null) return null;
 
-            Transform t = NewChild(name, root.transform);
+            Transform t = NewChild(name, parent);
             t.gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = t.gameObject.AddComponent<MeshRenderer>();
             mr.sharedMaterials = furled.sharedMaterials; // shared material: picks up the sail colour automatically
@@ -1015,7 +1500,38 @@ namespace StuddingSails
             return t.gameObject;
         }
 
-        private void LayoutRoll(Side sd, float sign, float xCenter, float length, float yUnder /* boom centre */)
+        /// <summary>
+        /// Size of the furled studding sail bundle: the same for every sail, RollSize times the bundle of
+        /// the parent's prefab (scaling it with the parent's height made it bulky on standard and big
+        /// sails). The furled transform may already be scaled with the sail height, so that is divided out.
+        /// </summary>
+        private float RollHeightFactor(Renderer furled)
+        {
+            float size = Mathf.Clamp(Studding.RollSize.Value, 0.1f, 2f);
+            try
+            {
+                var prefabGo = PrefabsDirectory.instance.sails[sail.prefabIndex];
+                Sail prefab = prefabGo != null ? prefabGo.GetComponent<Sail>() : null;
+                if (prefab == null) return size;
+
+                var prefabReef = prefab.GetComponent<ReefEffectAnimUniversal>();
+                float already = 1f;
+                if (prefabReef != null && prefabReef.furledSail != null)
+                {
+                    Vector3 a = furled.transform.lossyScale, p = prefabReef.furledSail.transform.lossyScale;
+                    // ship/sail placement scale is the same for both; compare the cross-section size
+                    float pm = Mathf.Abs(p.x) + Mathf.Abs(p.y) + Mathf.Abs(p.z);
+                    if (pm > 1e-4f) already = Mathf.Clamp((Mathf.Abs(a.x) + Mathf.Abs(a.y) + Mathf.Abs(a.z)) / pm, 0.2f, 3f);
+                }
+                return Mathf.Clamp(size / already, 0.05f, 3f);
+            }
+            catch (Exception)
+            {
+                return size;
+            }
+        }
+
+        private void LayoutRoll(Side sd, float sign, float xCenter, float length, float yUnder /* spar centre */, float z)
         {
             if (sd.Roll == null) return;
 
@@ -1037,7 +1553,8 @@ namespace StuddingSails
                            : axis == 1 ? Quaternion.Euler(0f, 0f, -90f)
                            : Quaternion.Euler(0f, 90f, 0f);
 
-            const float thin = 0.75f; // thinner than the parent sail
+            // thinner than the parent's bundle, one size for all sails (RollSize)
+            float thin = 0.75f * RollHeightFactor(furled);
             Vector3 scale = new Vector3(Mathf.Abs(lossy.x) * thin, Mathf.Abs(lossy.y) * thin, Mathf.Abs(lossy.z) * thin);
             float meshLen = axis == 0 ? sz.x : axis == 1 ? sz.y : sz.z;
             float along = length / Mathf.Max(0.01f, meshLen);
@@ -1047,7 +1564,7 @@ namespace StuddingSails
             for (int i = 0; i < 3; i++) if (i != axis) cross = Mathf.Max(cross, dims[i] * thin);
 
             // tucked under the boom, like the vanilla furled sail under its yard
-            Vector3 target = new Vector3(sign * xCenter, yUnder - cross * 0.3f, Studding.BoomOffsetZ.Value);
+            Vector3 target = new Vector3(sign * xCenter, yUnder - cross * 0.3f, z);
             Transform t = sd.Roll.transform;
             t.localRotation = rot;
             t.localScale = scale;
@@ -1061,9 +1578,11 @@ namespace StuddingSails
         /// </summary>
         private void SyncColor()
         {
-            if (clothMat == null || parentRenderer == null || sail.currentUnroll < 0.05f) return;
+            if (clothMat == null || parentRenderer == null) return;
 
-            Material pm = parentRenderer.sharedMaterial; // an empty material while the sail is furled
+            Color c;
+            bool hasColor;
+            Material pm = SourceMat(out c, out hasColor);
             if (pm == null || pm == clothMat) return;
 
             TryFitUv();
@@ -1088,26 +1607,97 @@ namespace StuddingSails
                 }
             }
 
-            if (!pm.HasProperty("_Color") || !clothMat.HasProperty("_Color")) return;
-
-            Color c = pm.color;
+            if (!hasColor || !clothMat.HasProperty("_Color")) return;
             if (c != clothMat.color) clothMat.color = c;
         }
 
-        private static Material[] MakeWoodMaterials(Renderer yardRend)
+        /// <summary>
+        /// Wood for our spars (booms, studding sail yards, yardarm extensions, blocks): the yard's own shader
+        /// with our own wood texture in the yard's colour. The yard texture itself is often a shared atlas laid
+        /// out for the yard's UVs, and on our spars it came out patchy.
+        /// </summary>
+        private Material[] MakeWoodMaterials(YardInfo info)
         {
-            if (yardRend != null && yardRend.sharedMaterials != null && yardRend.sharedMaterials.Length > 0)
+            Renderer yardRend = info.YardRenderer;
+            Material src = yardRend != null ? yardRend.sharedMaterial : null;
+
+            // best: the yard's own material, our spars carry the yard's texture coordinates (Spar mesh)
+            // the yard's own material when our spars can look the same with it: either we carry the yard's
+            // texture coordinates, or the yard has no texture at all (a plain painted colour, like the grey brig
+            // yards: their mesh has nothing to copy, and our own wood came out brown)
+            bool plain = src != null && src.mainTexture == null && StuddingGeom.BlockTex(yardRend) == "none";
+
+            // No texture coordinates to copy from the yard but a texture after all (the boat's big shared atlas:
+            // planking, fittings... mostly one plain colour): point the whole spar at the atlas's most common
+            // colour, which is the plain paint those yards use
+            if (src != null && info.EndUv == null)
             {
-                var src = yardRend.sharedMaterials;
-                var mats = new Material[src.Length];
-                for (int i = 0; i < mats.Length; i++)
-                    mats[i] = src[i] != null ? new Material(src[i]) : null;
-                return mats;
+                Texture atlas = StuddingGeom.AnyTexture(src, yardRend);
+                Vector2 at;
+                if (atlas != null && StuddingGeom.DominantUv(atlas, out at))
+                {
+                    info.EndUv = new Vector2[StuddingMeshes.SparSeg];
+                    for (int i = 0; i < info.EndUv.Length; i++) info.EndUv[i] = at;
+                    info.EndUv2 = info.EndUv;
+                    Plugin.Log.LogInfo("[Studding] " + sail.name + ": spars use the most common colour of '" + atlas.name + "' at uv " + at);
+                }
+            }
+            woodTextured = src != null && (info.EndUv != null || plain);
+            // shared, not copied: the yard's material is a per-boat instance (the boat paint, e.g.
+            // "medi_medium_paint (Instance)"), and anything that later repaints it repaints our spars too
+            if (woodTextured) return new[] { src };
+
+            // otherwise: the yard's shader with our own wood texture in the yard's colour
+            Material m = src != null ? new Material(src) : new Material(Shader.Find("Standard"));
+            m.name = "StuddingSparWood";
+            m.mainTexture = SparTexture(info.Tone);
+            m.mainTextureScale = Vector2.one;
+            m.mainTextureOffset = Vector2.zero;
+            if (m.HasProperty("_Color")) m.color = Color.white;
+            if (m.HasProperty("_BumpMap")) { m.SetTexture("_BumpMap", null); m.DisableKeyword("_NORMALMAP"); }
+            if (m.HasProperty("_DetailAlbedoMap")) m.SetTexture("_DetailAlbedoMap", null);
+            return new[] { m };
+        }
+
+        private static readonly Dictionary<int, Texture2D> sparTex = new Dictionary<int, Texture2D>();
+
+        /// <summary>
+        /// Spar wood: the tone with fine grain running along the spar. The spar mesh has u along its length
+        /// and v around it, so the grain varies with v only.
+        /// </summary>
+        private static Texture2D SparTexture(Color tone)
+        {
+            int key = Mathf.RoundToInt(tone.r * 255f) | (Mathf.RoundToInt(tone.g * 255f) << 8) | (Mathf.RoundToInt(tone.b * 255f) << 16);
+            Texture2D tex;
+            if (sparTex.TryGetValue(key, out tex) && tex != null) return tex;
+
+            const int size = 64;
+            var rnd = new System.Random(11);
+            var grain = new float[size];
+            float phase = (float)rnd.NextDouble() * 6.28f;
+            for (int y = 0; y < size; y++)
+            {
+                float v = y / (float)size * Mathf.PI * 2f;
+                grain[y] = 0.07f * Mathf.Sin(v * 4f + phase) + 0.04f * Mathf.Sin(v * 11f + phase * 1.7f) +
+                           0.035f * ((float)rnd.NextDouble() - 0.5f);
             }
 
-            var m = new Material(Shader.Find("Standard"));
-            m.color = new Color(0.243f, 0.173f, 0.125f);
-            return new Material[] { m };
+            var px = new Color[size * size];
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
+                {
+                    float along = 0.02f * Mathf.Sin(x / (float)size * Mathf.PI * 2f * 2f);
+                    float k = 1f + grain[y] + along + 0.015f * ((float)rnd.NextDouble() - 0.5f);
+                    px[y * size + x] = new Color(tone.r * k, tone.g * k, tone.b * k, 1f);
+                }
+
+            tex = new Texture2D(size, size, TextureFormat.RGBA32, true) { name = "StuddingSparWood" };
+            tex.wrapMode = TextureWrapMode.Repeat;
+            tex.filterMode = FilterMode.Bilinear;
+            tex.SetPixels(px);
+            tex.Apply(true, true);
+            sparTex[key] = tex;
+            return tex;
         }
 
         private static void CopyPropertyBlock(Renderer from, Renderer to)
@@ -1127,7 +1717,7 @@ namespace StuddingSails
             YardInfo b = StuddingGeom.Get(below);
             if (!b.Valid) return float.NaN;
             Vector3 c = root.transform.InverseTransformPoint(below.transform.TransformPoint(b.Center));
-            return c.y + b.Radius;
+            return c.y + b.TopOffset;
         }
 
         /// <summary>Point on the yard below (starboard side), in root space.</summary>
@@ -1157,16 +1747,32 @@ namespace StuddingSails
             const float outerMargin = 0.15f;
 
             float boomRadius = info.Radius * 0.75f;
-            float boomY = info.Radius + boomRadius * 0.9f; // lies on top of the main yard
+            float boomY = info.TopOffset + boomRadius * 0.9f; // lies on top of the main yard (also when flattened)
             float boomZ = Studding.BoomOffsetZ.Value;
 
-            // Inner edge: where the boom leaves the main yard end (overlap not counted), plus the gap
-            float yTop = -0.25f;
-            float xInTop = info.Half + gap;
-            float xOutTop = xInTop + panelWidth;
+            // Our boom: the base for the studding sail ABOVE (its foot is sheeted to it), laid out as before:
+            // from inside the yard end out past where that sail's foot reaches
+            float footIn = info.Half + gap;
             float aIn = info.Half - overlap;
-            float aOut = xOutTop + outerMargin;
+            laidAboveWidth = above != null && Studding.IsOn(above) ? Studding.PanelWidth(above) : 0f;
+            laidAboveFoot = above != null && Studding.IsOn(above) ? Studding.GetFootShift(above) : 0f;
+            float footW = laidAboveWidth > 0.2f ? laidAboveWidth : panelWidth; // as wide as the studding sail above
+            float aOut = footIn + footW + outerMargin;
+
+            // Our own studding sail hangs from its own small yard, hoisted by a halyard from its middle to our
+            // yardarm. The yard is lengthened so that the studding sail laps over the sail by HeadOverlap of
+            // its width only: yardarm = yard end + width * (0.5 - overlap)
+            laidArm = Studding.GetArm(sail);
+            float ext = laidArm >= 0f ? laidArm : panelWidth * (0.5f - Mathf.Clamp(Studding.HeadOverlap.Value, 0f, 0.5f));
+            float xHead = info.Half + ext;                          // studding sail yard centre, under the yardarm
+            float headR = Mathf.Max(0.03f, info.Radius * 0.45f);
+            float headZ = Studding.HeadOffsetZ.Value;               // in front of / behind the sail, clear of it
+            float yTop = -(info.Radius + Mathf.Max(0.2f, Studding.HalyardLength.Value)); // hangs on the halyard under the yard
+            float xInTop = xHead - panelWidth * 0.5f;
+            float xOutTop = xHead + panelWidth * 0.5f;
+            gHeadZ = headZ;
             float boomLen = aOut - aIn;
+            gRetract = Mathf.Max(0f, aOut - info.Half - 0.05f); // run in until the boom end reaches the yard end
 
             float xInBot, xOutBot, yBot;
             laidYBot = float.NaN;
@@ -1190,14 +1796,19 @@ namespace StuddingSails
                     laidYBot = yb;
                     float bLen = b.Half * 2f;
                     float bBoomR = b.Radius * 0.75f;
-                    float bInner = b.Half + gap;
-                    float bOuter = bInner + Mathf.Max(0.3f, bLen * Studding.PanelWidthRatio.Value * Studding.GetWidth(below));
+                    // the boom below is laid out by its own rig the same way (footIn); the inner foot corner is
+                    // moved along it by this sail's FootShift (negative = in, lapping over the sail below)
+                    laidFoot = Studding.GetFootShift(sail);
+                    float bInner = b.Half + gap + laidFoot;
+                    float bOuter = b.Half + gap + panelWidth; // the boom below is laid out as wide as this studding sail
+                    bInner = Mathf.Min(bInner, bOuter - 0.3f);
 
-                    Vector3 pIn = BelowPoint(b, bInner, b.Radius + bBoomR * 1.9f);
-                    Vector3 pOut = BelowPoint(b, bOuter, b.Radius + bBoomR * 1.9f);
+                    Vector3 pIn = BelowPoint(b, bInner, b.TopOffset + bBoomR * 1.9f);
+                    Vector3 pOut = BelowPoint(b, bOuter, b.TopOffset + bBoomR * 1.9f);
                     xInBot = Mathf.Abs(pIn.x);
                     xOutBot = Mathf.Abs(pOut.x);
-                    yBot = (pIn.y + pOut.y) * 0.5f + 0.2f;
+                    // the foot is sheeted down to the boom below on short ropes, clear of the sail below
+                    yBot = (pIn.y + pOut.y) * 0.5f + Mathf.Max(0.1f, Studding.FootLift.Value);
                 }
                 else
                 {
@@ -1209,6 +1820,7 @@ namespace StuddingSails
 
             gXInTop = xInTop; gXOutTop = xOutTop; gXInBot = xInBot; gXOutBot = xOutBot;
             gYTop = yTop; gYBot = yBot; gWidth = panelWidth;
+            gDrop = Mathf.Max(0f, yTop - yBot - 0.25f); // lowered, the yard lies just above the foot
             geomOk = panelWidth > 0.2f && (yTop - yBot) > 0.3f && xOutBot > xInBot - 0.001f;
 
             for (int s = 0; s < 2; s++)
@@ -1222,22 +1834,42 @@ namespace StuddingSails
 
                 sd.BoomTip.localPosition = new Vector3(sign * (aOut - 0.05f), boomY, boomZ);
                 sd.BoomInner.localPosition = new Vector3(sign * info.Half, boomY, boomZ);
-                sd.SheetInner.localPosition = new Vector3(sign * xInTop, boomY, boomZ);
+                // the inner sheet of the studding sail above, at its (shifted) inner foot corner
+                float sheetIn = footIn + (above != null && Studding.IsOn(above) ? Studding.GetFootShift(above) : 0f);
+                sd.SheetInner.localPosition = new Vector3(sign * sheetIn, boomY, boomZ);
 
-                sd.TopIn.localPosition = new Vector3(sign * xInTop, yTop, 0f);
-                sd.TopOut.localPosition = new Vector3(sign * xOutTop, yTop, 0f);
+                sd.TopIn.localPosition = new Vector3(sign * xInTop, yTop, headZ);
+                sd.TopOut.localPosition = new Vector3(sign * xOutTop, yTop, headZ);
 
-                // furled bundle along the visible boom length (from the main yard end to the boom end)
-                float rollFrom = info.Half + 0.05f, rollTo = aOut - 0.08f;
-                LayoutRoll(sd, sign, (rollFrom + rollTo) * 0.5f, rollTo - rollFrom, boomY);
+                // the studding sail's own yard along its head, the halyard from its middle
+                float headLen = panelWidth + 0.15f;
+                sd.HeadYard.localPosition = new Vector3(sign * xHead, yTop + headR, headZ);
+                sd.HeadYard.localRotation = s == 0 ? Quaternion.Euler(0f, 180f, 0f) : Quaternion.identity;
+                sd.HeadYard.localScale = new Vector3(headLen, headR, headR);
+                sd.HeadMid.localPosition = new Vector3(sign * xHead, yTop + headR * 2f, headZ);
+
+                // yardarm extension, coaxial with the yard, from a little inside its end out to the new yardarm
+                float armFrom = info.Half - 0.1f, armTo = info.Half + ext;
+                bool arm = ext > 0.05f;
+                sd.Arm.gameObject.SetActive(arm);
+                sd.Arm.localPosition = new Vector3(sign * (armFrom + armTo) * 0.5f, 0f, 0f);
+                sd.Arm.localRotation = s == 0 ? Quaternion.Euler(0f, 180f, 0f) : Quaternion.identity;
+                // the yard's own cross-section at its end (ShipyardExpansion flattens yards), tapering outwards
+                sd.Arm.localScale = new Vector3(armTo - armFrom, info.EndUp, info.EndN);
+                sd.ArmTip.localPosition = new Vector3(sign * (armTo - 0.08f), 0f, 0f);
+                gPivotX = armTo - 0.08f;
+
+                // furled bundle under the studding sail yard
+                LayoutRoll(sd, sign, xHead, panelWidth, yTop, headZ);
             }
 
             if (Studding.VerboseLog.Value)
             {
                 Plugin.Log.LogInfo(string.Format(
-                    "[Studding] {0}: {1} (below: {2}), boom={3:F2} m, panel top x[{4:F2}..{5:F2}] bottom x[{6:F2}..{7:F2}] y[{8:F2}..{9:F2}]",
+                    "[Studding] {0}: {1} (below: {2}, above: {10}), boom={3:F2} m, panel top x[{4:F2}..{5:F2}] bottom x[{6:F2}..{7:F2}] y[{8:F2}..{9:F2}]",
                     sail.name, triangle ? "triangle" : "trapezoid", below != null ? below.name : "none",
-                    boomLen, xInTop, xOutTop, xInBot, xOutBot, yTop, yBot));
+                    boomLen, xInTop, xOutTop, xInBot, xOutBot, yTop, yBot,
+                    above != null ? above.name + " [" + above.category + "]" : "none"));
             }
         }
 
@@ -1248,43 +1880,75 @@ namespace StuddingSails
         /// Furling smoothly raises the foot bone, like vanilla (where an armature animation furls the sail).
         /// The apex of the lowest triangular studding sail always follows the parent sail's clew.
         /// </summary>
-        private void UpdatePanels(bool deployed)
+        private void UpdatePanels(float[] canvas, float[] deploy)
         {
-            float k = deployed ? Mathf.Clamp01(sail.currentUnroll) : 0f;
-            if (Mathf.Abs(k - lastK) > 0.002f) { lastK = k; stableTime = 0f; }
+            float parentSet = sail.currentUnroll < 0.04f ? 0f : Mathf.Clamp01(sail.currentUnroll);
+            float kMax = 0f;
+            for (int s = 0; s < 2; s++)
+            {
+                float c = Mathf.Clamp01(canvas[s]);
+                float k;
+                if (!Studding.UseWinch.Value) k = parentSet * c;
+                else if (triangle) k = Mathf.Min(parentSet, c);
+                else k = c;
+                sideK[s] = k;
+                kMax = Mathf.Max(kMax, k);
+            }
+            if (Mathf.Abs(kMax - lastK) > 0.002f) { lastK = kMax; stableTime = 0f; }
             else stableTime += Time.deltaTime;
 
-            bool show = geomOk && k >= 0.06f;
-
             // the canvas is always full size: reefing pulls it up with bones instead of rebuilding
-            if (show && needBuild)
+            if (geomOk && kMax >= 0.06f && needBuild)
             {
                 needBuild = false;
                 BuildPanels(1f);
             }
 
-            if (show != panelsShown)
-            {
-                panelsShown = show;
-                for (int s = 0; s < 2; s++)
-                {
-                    Side sd = sides[s];
-                    if (sd.Roll != null) sd.Roll.SetActive(!show);
-                    if (sd.PanelGo != null) sd.PanelGo.SetActive(show);
-                }
-            }
-
-            if (!show) return;
-
-            // sail fully set: cloth always on; partly furled: per ClothWhileReefing
-            bool settled = Mathf.Abs(k - builtK) <= 0.02f;
-
             for (int s = 0; s < 2; s++)
             {
                 Side sd = sides[s];
-                if (sd.BotBone == null) continue;
+                float k = sideK[s];
+                bool show = geomOk && !needBuild && k >= 0.06f;
 
-                Vector3 target = BottomAt(s, k);
+                // before the hoist (the boom phase of the winch) the studding sail lies stowed: no yard, no
+                // bundle, no halyard; after that the furled bundle hangs under its yard until the canvas opens
+                bool stowed = deploy[s] < 0.28f && k <= 0f && GameState.currentShipyard == null;
+                headStowed[s] = stowed;
+                if (sd.Head != null && sd.Head.gameObject.activeSelf == stowed) sd.Head.gameObject.SetActive(!stowed);
+                bool roll = !show && !stowed;
+                if (sd.Roll != null && sd.Roll.activeSelf != roll) sd.Roll.SetActive(roll);
+
+                if (show != sideShown[s])
+                {
+                    sideShown[s] = show;
+                    if (sd.PanelGo != null) sd.PanelGo.SetActive(show);
+                }
+                if (!show || sd.BotBone == null) continue;
+
+                // the foot stays at the boom below (the triangle at the clew); the head is hoisted (UpdateSwing).
+                // The boom below belongs to another yard, braced on its own: follow where its inner sheet point
+                // actually is (along and fore/aft), otherwise the foot hangs in the old plane and the sheets
+                // run off forward or aft
+                Vector3 target = BottomAt(s, 1f);
+                if (!builtTri && below != null)
+                {
+                    StuddingRig br = Of(below);
+                    Side bs = br != null && br.Visible ? br.sides[s] : null;
+                    if (bs != null && bs.SheetInner != null && bs.Boom != null && bs.Boom.gameObject.activeInHierarchy)
+                    {
+                        // only along the yard: pulling the foot fore/aft into the plane of the yard below
+                        // flattened the studding sail against its sail (it no longer blew out past it)
+                        Vector3 p = root.transform.InverseTransformPoint(bs.SheetInner.position);
+                        target = new Vector3(p.x, target.y, target.z);
+                    }
+
+                    // the foot hangs on its sheets above the boom: the wind blows it out the same way as the
+                    // yard above (the head swing), as far as the sheets let it - computed, not read back from
+                    // the cloth, so it costs nothing
+                    float sheet = Mathf.Max(0.1f, Studding.FootLift.Value);
+                    Vector3 d = Quaternion.AngleAxis(sd.Ang, Vector3.right) * Vector3.down;
+                    target += new Vector3(0f, -(1f + d.y) * sheet, d.z * sheet);
+                }
                 if (builtTri)
                 {
                     Transform clew = FindClew(s);
@@ -1299,6 +1963,7 @@ namespace StuddingSails
                 sd.BotBone.localPosition = target;
 
                 // like vanilla: cloth keeps running while furling, bones only move the pinned vertices
+                bool settled = Mathf.Abs(k - builtK) <= 0.02f;
                 bool clothOn = settled || Studding.ClothWhileReefing.Value;
                 if (sd.Cloth != null && sd.Cloth.enabled != clothOn)
                 {
@@ -1306,6 +1971,7 @@ namespace StuddingSails
                     if (clothOn) sd.CoeffPending = true;
                 }
             }
+            panelsShown = sideShown[0] || sideShown[1];
         }
 
         /// <summary>Inner lower corner at set fraction k (along the side edge).</summary>
@@ -1445,10 +2111,90 @@ namespace StuddingSails
         /// animation) rather than the rest-pose mesh, which differs between sails. Done once, when the sail
         /// is fully set; until then the studding sails use the built-in canvas.
         /// </summary>
+        private void ApplyUvToPanels()
+        {
+            for (int s = 0; s < 2; s++)
+            {
+                Side sd = sides[s];
+                if (sd == null || sd.PanelMesh == null || sd.RestVerts == null) continue;
+                sd.PanelMesh.uv = SailUv(sd.RestVerts, s == 0 ? -1f : 1f);
+            }
+        }
+
+        /// <summary>
+        /// The sail's cloth material: its own while it is set. While it is furled the game gives the canvas an
+        /// empty material, so then the sail type's prefab canvas material is used (texture), tinted with the
+        /// colour of the furled bundle (the sail colour).
+        /// </summary>
+        private Material SourceMat(out Color color, out bool hasColor)
+        {
+            color = Color.white;
+            hasColor = false;
+            Material pm = parentRenderer != null ? parentRenderer.sharedMaterial : null;
+            if (pm != null && pm != clothMat && sail.currentUnroll >= 0.05f && HasTex(pm))
+            {
+                hasColor = pm.HasProperty("_Color");
+                if (hasColor) color = pm.color;
+                return pm;
+            }
+
+            Material prefab = PrefabCloth();
+            if (furledRend != null && furledRend.sharedMaterial != null && furledRend.sharedMaterial.HasProperty("_Color"))
+            {
+                color = furledRend.sharedMaterial.color;
+                hasColor = true;
+            }
+            else if (prefab != null && prefab.HasProperty("_Color"))
+            {
+                color = prefab.color;
+                hasColor = true;
+            }
+            return prefab;
+        }
+
+        private static bool HasTex(Material m)
+        {
+            return m != null && m.HasProperty("_MainTex") && m.GetTexture("_MainTex") != null;
+        }
+
+        private Material prefabCloth;
+        private bool prefabClothTried;
+
+        private Material PrefabCloth()
+        {
+            if (prefabClothTried) return prefabCloth;
+            prefabClothTried = true;
+            try
+            {
+                var go = PrefabsDirectory.instance.sails[sail.prefabIndex];
+                Sail ps = go != null ? go.GetComponent<Sail>() : null;
+                var smr = ps != null && ps.cloth != null ? ps.cloth.GetComponent<SkinnedMeshRenderer>() : null;
+                if (smr != null && HasTex(smr.sharedMaterial)) prefabCloth = smr.sharedMaterial;
+            }
+            catch (Exception) { }
+            return prefabCloth;
+        }
+
         private void TryFitUv()
         {
-            if (uvFitted || !useSailTexture || curInfo == null) return;
-            if (sail.currentUnroll < 0.97f) return;
+            if ((uvFitted && !uvProvisional) || !useSailTexture || curInfo == null) return;
+            if (sail.currentUnroll < 0.97f)
+            {
+                // the sail has not been set yet (e.g. fresh from the shipyard): use the layout fitted on its
+                // rest-pose mesh for now, so the studding sails already carry the sail's cloth
+                if (!uvFitted && curInfo.UvOk)
+                {
+                    uUw = curInfo.UvUw; uUh = curInfo.UvUh; uU0 = curInfo.UvU0;
+                    uVw = curInfo.UvVw; uVh = curInfo.UvVh; uV0 = curInfo.UvV0;
+                    uvTop = curInfo.TopU; uvBot = curInfo.BottomU;
+                    uvEdge = curInfo.TopHalf > 0.3f ? curInfo.TopHalf : curInfo.Half;
+                    uvFitted = true;
+                    uvProvisional = true;
+                    uvNote = "provisional: rest-pose fit (" + curInfo.UvNote + ")";
+                    ApplyUvToPanels();
+                }
+                return;
+            }
 
             var smr = parentRenderer as SkinnedMeshRenderer;
             if (smr == null || smr.sharedMesh == null) { useSailTexture = false; return; }
@@ -1499,15 +2245,11 @@ namespace StuddingSails
                 uVw = cv[0]; uVh = cv[1]; uV0 = cv[2];
                 uvTop = maxU; uvBot = minU; uvEdge = edge > 0.3f ? edge : i.Half;
                 uvFitted = true;
+                uvProvisional = false;
                 uvNote = string.Format("fitted on baked mesh: span={0:F2} edge={1:F2}", span, uvEdge);
 
                 // apply the new UVs to existing canvases (no cloth rebuild)
-                for (int s = 0; s < 2; s++)
-                {
-                    Side sd = sides[s];
-                    if (sd == null || sd.PanelMesh == null || sd.RestVerts == null) continue;
-                    sd.PanelMesh.uv = SailUv(sd.RestVerts, s == 0 ? -1f : 1f);
-                }
+                ApplyUvToPanels();
             }
             catch (Exception e)
             {
@@ -1516,10 +2258,63 @@ namespace StuddingSails
             }
         }
 
+        /// <summary>
+        /// The studding sail yard hangs on its halyard from the yardarm block: a damped pendulum swinging
+        /// across the sail, blown out by the wind across the canvas (more when the canvas is set) and swinging
+        /// back with inertia when it eases or the boat turns. Visual only: the boat's forces are unchanged.
+        /// </summary>
+        private void UpdateSwing(int s)
+        {
+            Side sd = sides[s];
+            if (sd == null || sd.Head == null || root == null) return;
+            float dt = Mathf.Min(Time.deltaTime, 0.05f);
+            if (dt <= 0f) return;
+
+            // hoist: the yard runs up the halyard from just above the foot to its full height under the yardarm
+            float hoist = sideShown[s] ? sideK[s] : 0f;
+            float lower = gDrop * (1f - hoist);
+
+            // wind across the canvas blows the hanging yard out: in proportion to how much canvas is set
+            // (a furled bundle catches little), and never further out than the set canvas lets it
+            Vector3 wind = root.transform.InverseTransformDirection(sail.apparentWind);
+            // a bare yard with its bundle catches next to nothing; the canvas takes over as it opens
+            float push = wind.z * sail.GetCurrentShadowMult() * (0.03f + 0.97f * hoist * hoist);
+            float target = push * Mathf.Max(0f, Studding.SwingStrength.Value);
+
+            float len = Mathf.Max(0.2f, Studding.HalyardLength.Value) + lower;
+            float maxOut = 0.05f + 1.6f * hoist; // m sideways at the yard
+            float maxAng = Mathf.Min(50f, Mathf.Asin(Mathf.Clamp01(maxOut / len)) * Mathf.Rad2Deg);
+            target = Mathf.Clamp(target, -maxAng, maxAng) * SwingSign;
+            float omega = Mathf.Sqrt(9.81f / len);
+            sd.AngVel += (omega * omega * (target - sd.Ang) - 2f * 0.35f * omega * sd.AngVel) * dt;
+            sd.Ang += sd.AngVel * dt;
+            if (float.IsNaN(sd.Ang) || Mathf.Abs(sd.Ang) > 80f) { sd.Ang = Mathf.Clamp(target, -50f, 50f); sd.AngVel = 0f; }
+
+            ApplySwing(sd, s == 0 ? -1f : 1f, sd.Ang, lower);
+        }
+
+        /// <summary>Head lowered by "lower" on its halyard and swung by ang degrees about the yardarm block.</summary>
+        private void ApplySwing(Side sd, float sign, float ang, float lower)
+        {
+            Quaternion q = Quaternion.AngleAxis(ang, Vector3.right);
+            Vector3 pivot = new Vector3(sign * gPivotX, 0f, 0f);
+            sd.Head.localRotation = q;
+            sd.Head.localPosition = pivot - q * pivot + q * new Vector3(0f, -lower, 0f);
+        }
+
+        /// <summary>+1 if a positive angle swings the hanging head towards +Z (the canvas normal).</summary>
+        private static readonly float SwingSign =
+            Mathf.Sign((Quaternion.AngleAxis(1f, Vector3.right) * Vector3.down).z);
+
         private void BuildPanels(float k)
         {
+            // build with the head at rest: the bind poses are taken from the current bone positions
+            for (int s = 0; s < 2; s++)
+                if (sides[s] != null && sides[s].Head != null) ApplySwing(sides[s], s == 0 ? -1f : 1f, 0f, 0f);
+
             Area = 0f;
             panelsShown = false;
+            sideShown[0] = sideShown[1] = false;
             builtK = k;
             builtTri = triangle; // the triangle stays a triangle while furling, its apex follows the clew
 
@@ -1533,8 +2328,8 @@ namespace StuddingSails
                 if (sd.BotBone != null)
                 {
                     // corner anchors live on the foot bone: move them to the root, delete the bone
-                    sd.BotIn.SetParent(root.transform, false);
-                    sd.BotOut.SetParent(root.transform, false);
+                    sd.BotIn.SetParent(sd.Canvas, false);
+                    sd.BotOut.SetParent(sd.Canvas, false);
                     UnityEngine.Object.Destroy(sd.BotBone.gameObject);
                 }
                 sd.PanelGo = null;
@@ -1543,7 +2338,7 @@ namespace StuddingSails
                 sd.BotBone = null;
                 sd.CoeffPending = false;
 
-                if (sd.Roll != null) sd.Roll.SetActive(true);
+                // roll visibility is decided in UpdatePanels
                 if (!geomOk) continue;
 
                 bool tri = builtTri;
@@ -1554,9 +2349,9 @@ namespace StuddingSails
                 Vector3 pinOut = new Vector3(sign * (tri ? xInBot : xOutBot), yBot, 0f);
 
                 // bones
-                sd.TopBone = NewChild("TopBone", root.transform);
+                sd.TopBone = NewChild("TopBone", sd.Head);
                 sd.TopBone.localPosition = new Vector3(0f, gYTop, 0f);
-                sd.BotBone = NewChild("BotBone", root.transform);
+                sd.BotBone = NewChild("BotBone", sd.Canvas);
                 sd.BotBone.localPosition = pinIn;
                 sd.BotRest = pinIn;
 
@@ -1570,13 +2365,16 @@ namespace StuddingSails
 
                 var go = new GameObject("Panel_" + (s == 0 ? "L" : "R"));
                 go.layer = sail.gameObject.layer;
-                go.transform.SetParent(root.transform, false);
+                go.transform.SetParent(sd.Canvas, false);
                 go.SetActive(false);
 
                 float height = gYTop - yBot;
                 // a sine arc is longer than its chord by (pi^2/4)*(depth/chord)^2 -> depth for the requested slack
-                float bulge = tri ? 0f : height * (2f / Mathf.PI) * Mathf.Sqrt(Mathf.Max(0f, Studding.Fullness.Value));
-                float belly = tri ? 0f : gWidth * (2f / Mathf.PI) * Mathf.Sqrt(Mathf.Max(0f, Studding.Belly.Value));
+                // the triangle gets the same slack as the four-sided ones (it has no foot, so no roach)
+                // the triangle gets less (it rolled up untidily in a cross wind): TriangleSlack of the slack
+                float triK = tri ? Studding.TriangleSlack.Value : 1f;
+                float bulge = height * (2f / Mathf.PI) * Mathf.Sqrt(Mathf.Max(0f, Studding.Fullness.Value * triK));
+                float belly = gWidth * (2f / Mathf.PI) * Mathf.Sqrt(Mathf.Max(0f, Studding.Belly.Value * triK));
                 // grid density like vanilla sails (~0.6 m per cell): on a finer grid
                 // Unity cloth is noticeably stiffer and barely moves
                 float cell = Mathf.Max(0.2f, Studding.ClothCell.Value);
@@ -1587,7 +2385,7 @@ namespace StuddingSails
                 sd.PanelMesh = new Mesh();
                 sd.PanelMesh.name = "studding_panel";
                 Area += StuddingMeshes.BuildGrid(sd.PanelMesh, sign, gXInTop, gXOutTop, xInBot, xOutBot,
-                    gYTop, yBot, tri, nu, nv, bulge, belly);
+                    gYTop, yBot, tri, nu, nv, bulge, belly, gHeadZ);
 
                 // weights: head on the top bone, blending to the foot bone
                 Vector3[] mv = sd.PanelMesh.vertices;
@@ -1701,17 +2499,19 @@ namespace StuddingSails
         }
 
         /// <summary>Wind like vanilla (WindCloth: externalAcceleration = 2 x apparent wind), with a multiplier.</summary>
-        private void UpdateClothWind(Side sd)
+        private void UpdateClothWind(Side sd, int s)
         {
             if (sd.Cloth == null) return;
 
+            // Same formula as vanilla WindCloth (staticMultiplier 2 on these sails), but with our own set
+            // fraction instead of the parent's, so a studding sail set under a furled sail still fills.
             Cloth pc = sail.cloth;
-            Vector3 ext = pc != null ? pc.externalAcceleration : Vector3.zero;
             Vector3 rnd = pc != null ? pc.randomAcceleration : Vector3.zero;
-            if (ext.sqrMagnitude < 0.0001f) ext = sail.apparentWind * 2f;
+            Vector3 ext = sail.apparentWind * 2f * sideK[s] * sail.GetCurrentShadowMult();
 
-            // vanilla flutter comes from WindCloth: damping follows the captured wind fraction every frame
-            if (pc != null) sd.Cloth.damping = pc.damping;
+            // vanilla flutter comes from WindCloth: damping follows the captured wind fraction every frame;
+            // while the parent is furled its damping is pinned to max, so use a neutral value then
+            if (pc != null) sd.Cloth.damping = sail.currentUnroll >= 0.1f ? pc.damping : 0.5f;
 
             float mul = Studding.ClothWind.Value;
             sd.Cloth.externalAcceleration = ext * mul;
@@ -1722,6 +2522,29 @@ namespace StuddingSails
         }
 
         // ------------------------------------------------------------ neighbours in the stack
+
+        private sealed class SailList { public float Until; public Sail[] Sails; }
+        private static readonly Dictionary<GameObject, SailList> shipSails = new Dictionary<GameObject, SailList>();
+
+        /// <summary>
+        /// The boat's sails, shared by all rigs and refreshed at most every 2 s (at the shipyard every 0.5 s,
+        /// sails come and go there): one search per boat instead of one per rig every half second.
+        /// </summary>
+        private static Sail[] ShipSails(GameObject ship)
+        {
+            SailList l;
+            if (!shipSails.TryGetValue(ship, out l) || l == null)
+            {
+                l = new SailList();
+                shipSails[ship] = l;
+            }
+            if (l.Sails == null || Time.time >= l.Until)
+            {
+                l.Sails = ship.GetComponentsInChildren<Sail>(false);
+                l.Until = Time.time + (GameState.currentShipyard != null ? 0.5f : 2f);
+            }
+            return l.Sails;
+        }
 
         /// <summary>Nearest square sail above/below in the same stack (mast + topmast).</summary>
         private Sail FindNeighbour(bool up)
@@ -1735,10 +2558,10 @@ namespace StuddingSails
             Sail best = null;
             float bestDy = float.MaxValue;
 
-            foreach (var other in ship.GetComponentsInChildren<Sail>(false))
+            foreach (var other in ShipSails(shipGo))
             {
-                if (other == null || other == sail) continue;
-                if (!other.squareSail || Plugin.IsExcludedSail(other)) continue;
+                if (other == null || other == sail || !other.gameObject.activeInHierarchy) continue;
+                if (!Studding.IsSquare(other) || Plugin.IsExcludedSail(other)) continue;
 
                 Vector3 p = ship.InverseTransformPoint(other.transform.position);
                 float dx = p.x - me.x, dz = p.z - me.z;
@@ -1780,20 +2603,12 @@ namespace StuddingSails
                 Side sd = sides[s];
                 string k = s.ToString();
 
-                if (panelsShown)
-                {
-                    // Head corners to their own boom: inner above the main yard end, outer to the boom end
-                    EnsureRope("lashIn" + k, sd.TopIn, sd.BoomInner, true, 0.97f, true, false, 0.7f);
-                    EnsureRope("lashOut" + k, sd.TopOut, sd.BoomTip, true, 0.97f, true, false, 0.7f);
-                }
-                else
-                {
-                    EnsureRope("lashIn" + k, null, null, true, 0f, false, false, 0f);
-                    EnsureRope("lashOut" + k, null, null, true, 0f, false, false, 0f);
-                }
+                // Halyard: from the middle of the studding sail yard up to the block at our yardarm
+                if (!headStowed[s]) EnsureRope("halyard" + k, sd.HeadMid, sd.ArmTip, false, 0.95f, true, true, 0.8f);
+                else EnsureRope("halyard" + k, null, null, false, 0f, false, false, 0f);
 
-                // Lower corners sheeted to the boom below (the lowest triangle has no sheet)
-                if (panelsShown && !triangle && below != null)
+                // Lower corners sheeted to the boom below (the lowest triangle is tacked to the clew)
+                if (sideShown[s] && !triangle && below != null)
                 {
                     EnsureRope("sheetIn" + k, sd.BotIn, BoomTipOf(below, s, true), true, 0.97f, true, false, 0.8f); // no block on the yard: vanilla already has one
                     EnsureRope("sheetOut" + k, sd.BotOut, BoomTipOf(below, s, false), true, 0.97f, true, false, 0.8f); // no block on the yard: vanilla already has one
@@ -1803,11 +2618,6 @@ namespace StuddingSails
                     EnsureRope("sheetIn" + k, null, null, true, 0f, false, false, 0f);
                     EnsureRope("sheetOut" + k, null, null, true, 0f, false, false, 0f);
                 }
-
-                // The halyard always holds the boom: to the studding boom (or main yard) end above
-                // for the topmost studding sails, to the block at the masthead
-                Transform up = above != null ? BoomTipOf(above, s, false) : MastTopBlock();
-                EnsureRope("halyard" + k, sd.BoomTip, up, false, 0.95f, false, false, 0.8f);
             }
         }
 
@@ -1942,7 +2752,7 @@ namespace StuddingSails
             b.localScale = new Vector3(0.14f, 0.045f, 0.035f);
             b.gameObject.AddComponent<MeshFilter>().sharedMesh = StuddingMeshes.Boom();
             var mr = b.gameObject.AddComponent<MeshRenderer>();
-            mr.sharedMaterials = woodMats;
+            mr.sharedMaterials = BlockMats();
             mr.shadowCastingMode = ShadowCastingMode.On;
         }
 
