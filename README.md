@@ -8,7 +8,7 @@ A mod for **Sailwind** (BepInEx 5) that adds studding sails to square sails: ext
 ## How it works
 
 - **Buy them at the shipyard.** Select a square sail and press **Studding: On**. The price grows with the studding sail width.
-- **Set them with winches.** Every mast with studding sails gets two winches, one for each side. Crank a winch and:
+- **Set them with winches.** Port and starboard winches on every mast with studding sails, separately for topmasts.. Crank a winch and:
   1. a boom runs out along the yard below;
   2. the studding sail is hoisted on its own small yard up to the end of the main yard, and the canvas opens.
 - **Steer with them.** Set studding sails on one side only and the boat turns. Set them on both sides for straight-line speed. They work even when the main sail is furled.
