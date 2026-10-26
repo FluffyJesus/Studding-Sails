@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -36,6 +36,9 @@ namespace StuddingSails
         private StuddingRopeController controller;
         private Transform peg;
         private GameObject rope;
+        private GameObject coil;            // the rope coil shown in place of the winch (UseRopeCoil), or null
+        private float standOff = StandOff;  // winch centre from the mast surface (less for a flat coil)
+        private float spacing = 0.35f;      // between neighbouring winches on the mast
         private float nextCheck;
         private bool needed;
 
@@ -99,10 +102,12 @@ namespace StuddingSails
                 if (winch != null) Destroy(winch.gameObject);
                 if (controller != null) Destroy(controller.gameObject);
                 if (peg != null) Destroy(peg.gameObject);
+                if (coil != null) Destroy(coil);
                 ShowFall(false);
                 winch = null;
                 controller = null;
                 peg = null;
+                coil = null;
                 nextTry = Time.time + 5f;
             }
         }
@@ -129,11 +134,31 @@ namespace StuddingSails
 
             // where: on the mast itself, on a peg, just above the vanilla winches (MastMountPose);
             // if the mast line looks wrong - stacked above the vanilla winches (WinchPose)
+            // what it looks like on a modded boat's peg: a coil of rope (the mooring rope's model), flat against
+            // the mast, so it sits closer to it and needs more room beside its neighbours
+            CoilModel coilModel = Studding.UseRopeCoil.Value && !IsVanillaBoat(mast) ? FindCoilModel() : null;
+            float coilScale = 0f;
+            if (coilModel != null)
+            {
+                float d = Mathf.Clamp(Studding.RopeCoilSize.Value, 0.1f, 1f);
+                coilScale = d / coilModel.Diameter;
+                float depth = coilModel.Depth * coilScale;
+                standOff = depth * 0.5f + 0.03f;
+                spacing = Mathf.Max(0.35f, d + 0.05f);
+                pegFront = depth * 0.5f + 0.01f;
+                fallRadius = d * 0.45f;
+            }
+
             Transform parent = null;
             Vector3 pos = Vector3.zero;
             Quaternion rot = Quaternion.identity;
             bool onMast = MastMountPose(template, out parent, out pos, out rot);
-            if (!onMast) WinchPose(template, out parent, out pos, out rot);
+            if (!onMast)
+            {
+                WinchPose(template, out parent, out pos, out rot);
+                coilModel = null; // stacked with the mast's winches: the same as its neighbours
+                fallRadius = DrumRadius;
+            }
 
             // controller first: the winch talks to it
             var cgo = new GameObject("StuddingRopeController");
@@ -157,6 +182,11 @@ namespace StuddingSails
             // in red (after a teleport). Remove the copies: our winch adds a fresh one in its own Start.
             foreach (var c in clone.GetComponentsInChildren<Component>(true))
                 if (c != null && c.GetType().Name == "Outline") DestroyImmediate(c);
+            if (coilModel != null && !DressAsCoil(clone, coilModel, coilScale))
+            {
+                coilModel = null;
+                fallRadius = DrumRadius;
+            }
 
             winch = clone.GetComponent<GPButtonRopeWinch>();
             winch.enableRedOutline = false;
@@ -174,7 +204,174 @@ namespace StuddingSails
             AddRope(clone.transform, ship);
             Plugin.Log.LogInfo("[Studding] " + (side == 0 ? "port" : "starboard") + " studding sail winch for mast " + mast.name +
                                (onMast ? " pinned to the mast" : " stacked with the mast's winches") +
-                               ", copied from '" + template.name + "' (active " + template.gameObject.activeInHierarchy + ")");
+                               ", copied from '" + template.name + "' (active " + template.gameObject.activeInHierarchy + ")" +
+                               (coil != null ? ", shown as a rope coil from '" + coilModel.Source + "'" : ""));
+        }
+
+        // ------------------------------------------------------------ the rope coil
+
+        /// <summary>The mooring rope coil's model: mesh, materials and its size in metres along the mesh axes.</summary>
+        private sealed class CoilModel
+        {
+            public Mesh Mesh;
+            public Material[] Materials;
+            public Vector3 Scale;   // world scale of the source (mesh units -> metres)
+            public Vector3 Size;    // mesh bounds, metres
+            public Vector3 Centre;  // mesh bounds centre, metres along the mesh axes
+            public int Axis;        // the coil's own axis: its thinnest side
+            public string Source;
+
+            public float Depth { get { return Size[Axis]; } }
+            public float Diameter { get { return Mathf.Max(Size[(Axis + 1) % 3], Size[(Axis + 2) % 3]); } }
+        }
+
+        private static CoilModel coilCache;
+        private static float nextCoilSearch;
+        private static Mesh emptyMesh;
+        private cakeslice.Outline coilOutline, winchOutline;
+
+        /// <summary>
+        /// The model of a mooring rope coil (PickupableBoatMooringRope: every boat carries some), a vanilla boat's
+        /// one first. Only its mesh and materials are used: the coil itself is a saved, pickable item tied to its boat.
+        /// </summary>
+        private static CoilModel FindCoilModel()
+        {
+            if (coilCache != null && coilCache.Mesh != null) return coilCache;
+            if (Time.time < nextCoilSearch) return null;
+            nextCoilSearch = Time.time + 5f;
+
+            string list = Studding.VanillaBoats.Value;
+            bool haveList = !string.IsNullOrEmpty(list) && list.Trim().Length > 0;
+            MeshFilter best = null;
+            bool bestVanilla = false;
+            float bestSize = 0f;
+            foreach (var rope in FindObjectsOfType<PickupableBoatMooringRope>())
+            {
+                if (rope == null) continue;
+                bool vanilla = haveList && InList(rope.transform, list);
+                foreach (var mf in rope.GetComponentsInChildren<MeshFilter>(true))
+                {
+                    if (mf == null || mf.sharedMesh == null) continue;
+                    var mr = mf.GetComponent<MeshRenderer>();
+                    if (mr == null || mr.sharedMaterial == null) continue;
+                    float size = Vector3.Scale(mf.sharedMesh.bounds.size, Abs(mf.transform.lossyScale)).magnitude;
+                    bool better = best == null || (vanilla && !bestVanilla) || (vanilla == bestVanilla && size > bestSize);
+                    if (!better) continue;
+                    best = mf;
+                    bestVanilla = vanilla;
+                    bestSize = size;
+                }
+            }
+            if (best == null)
+            {
+                Plugin.Log.LogWarning("[Studding] no mooring rope coil found to copy, the studding sail winch keeps the winch look");
+                return null;
+            }
+
+            Vector3 s = Abs(best.transform.lossyScale);
+            Bounds b = best.sharedMesh.bounds;
+            var m = new CoilModel
+            {
+                Mesh = best.sharedMesh,
+                Materials = best.GetComponent<MeshRenderer>().sharedMaterials,
+                Scale = s,
+                Size = Vector3.Scale(b.size, s),
+                Centre = Vector3.Scale(b.center, s),
+                Source = best.name + "' on '" + best.transform.root.name,
+            };
+            m.Axis = m.Size.x <= m.Size.y && m.Size.x <= m.Size.z ? 0 : (m.Size.y <= m.Size.z ? 1 : 2);
+            if (m.Diameter < 0.01f) return null;
+            Plugin.Log.LogInfo("[Studding] rope coil model '" + m.Source + "': " + m.Size.ToString("F2") + " m, axis " + "XYZ"[m.Axis]);
+            coilCache = m;
+            return m;
+        }
+
+        /// <summary>
+        /// Show the winch as a rope coil. The winch itself stays (it turns when worked, which is how it measures
+        /// the rope) but draws nothing and loses its own parts; the coil hangs on it and turns with it, centred on the
+        /// spindle with its axis along it, and lights up together with the winch (LateUpdate). The winch's
+        /// collider is fitted to the coil.
+        /// </summary>
+        private bool DressAsCoil(GameObject clone, CoilModel model, float scale)
+        {
+            var mf = clone.GetComponent<MeshFilter>();
+            if (mf == null) return false;
+            if (emptyMesh == null) emptyMesh = new Mesh { name = "StuddingNoWinch" };
+            mf.sharedMesh = emptyMesh;
+            Transform wt = clone.transform;
+            for (int i = wt.childCount - 1; i >= 0; i--) DestroyImmediate(wt.GetChild(i).gameObject);
+
+            var go = new GameObject("StuddingRopeCoil");
+            go.layer = clone.layer;
+            Transform t = go.transform;
+            t.SetParent(wt.parent, false);
+            Vector3 axis = model.Axis == 0 ? Vector3.right : model.Axis == 1 ? Vector3.up : Vector3.forward;
+            t.rotation = wt.rotation * Quaternion.FromToRotation(axis, Vector3.forward);
+            Vector3 p = wt.parent != null ? Abs(wt.parent.lossyScale) : Vector3.one;
+            float pu = Mathf.Max(1e-4f, (p.x + p.y + p.z) / 3f);
+            t.localScale = model.Scale * (scale / pu);
+            t.position = wt.position - t.rotation * (model.Centre * scale);
+            go.AddComponent<MeshFilter>().sharedMesh = model.Mesh;
+            go.AddComponent<MeshRenderer>().sharedMaterials = model.Materials;
+            coilOutline = go.AddComponent<cakeslice.Outline>();
+            coilOutline.enabled = false;
+            // on the winch: the coil turns with it when worked
+            t.SetParent(wt, true);
+            coil = go;
+
+            FitCollider(clone, model.Diameter * scale, model.Depth * scale);
+            return true;
+        }
+
+        /// <summary>Winch colliders around the coil: a disc of diameter d and thickness depth on the spindle.</summary>
+        private static void FitCollider(GameObject go, float d, float depth)
+        {
+            Vector3 s = Abs(go.transform.lossyScale);
+            var size = new Vector3(d / Mathf.Max(1e-4f, s.x), d / Mathf.Max(1e-4f, s.y), depth / Mathf.Max(1e-4f, s.z));
+            float r = 0.5f * Mathf.Max(size.x, size.y);
+            foreach (var c in go.GetComponents<Collider>())
+            {
+                var box = c as BoxCollider;
+                if (box != null) { box.center = Vector3.zero; box.size = size; continue; }
+                var sphere = c as SphereCollider;
+                if (sphere != null) { sphere.center = Vector3.zero; sphere.radius = r; continue; }
+                var capsule = c as CapsuleCollider;
+                if (capsule != null) { capsule.center = Vector3.zero; capsule.direction = 2; capsule.radius = r; capsule.height = 2f * r; continue; }
+                var mc = c as MeshCollider;
+                if (mc != null) { mc.sharedMesh = BoxMesh(size); mc.convex = true; }
+            }
+        }
+
+        private static Mesh BoxMesh(Vector3 size)
+        {
+            Vector3 h = size * 0.5f;
+            var v = new Vector3[8];
+            for (int i = 0; i < 8; i++) v[i] = new Vector3((i & 1) != 0 ? h.x : -h.x, (i & 2) != 0 ? h.y : -h.y, (i & 4) != 0 ? h.z : -h.z);
+            int[] t =
+            {
+                0, 2, 1, 1, 2, 3,  4, 5, 6, 5, 7, 6, // -z, +z
+                0, 1, 4, 1, 5, 4,  2, 6, 3, 3, 6, 7, // -y, +y
+                0, 4, 2, 2, 4, 6,  1, 3, 5, 3, 7, 5, // -x, +x
+            };
+            var mesh = new Mesh { name = "StuddingCoilCollider", vertices = v, triangles = t };
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        private static Vector3 Abs(Vector3 v) { return new Vector3(Mathf.Abs(v.x), Mathf.Abs(v.y), Mathf.Abs(v.z)); }
+
+        /// <summary>The coil lights up exactly when the winch it stands for does.</summary>
+        private void LateUpdate()
+        {
+            if (coilOutline == null || winch == null) return;
+            if (winchOutline == null)
+            {
+                winchOutline = winch.GetComponent<cakeslice.Outline>(); // added in the winch's Start
+                if (winchOutline == null) return;
+            }
+            if (coilOutline.color != winchOutline.color) coilOutline.color = winchOutline.color;
+            bool lit = winchOutline.enabled && coil.activeInHierarchy;
+            if (coilOutline.enabled != lit) coilOutline.enabled = lit;
         }
 
         // ------------------------------------------------------------ vanilla or modded boat
@@ -188,7 +385,12 @@ namespace StuddingSails
         {
             string list = Studding.VanillaBoats.Value;
             if (string.IsNullOrEmpty(list) || list.Trim().Length == 0) return true;
+            return InList(mast.transform, list);
+        }
 
+        /// <summary>Is t on a boat named in the comma-separated list (any part of an ancestor's name)?</summary>
+        private static bool InList(Transform from, string list)
+        {
             // the boat name can sit on any ancestor (PurchasableBoat, the rigidbody, the root), so check them all
             var parts = new List<string>();
             foreach (var part in list.Split(','))
@@ -197,7 +399,7 @@ namespace StuddingSails
                 if (p.Length > 0) parts.Add(p);
             }
 
-            for (Transform t = mast.transform; t != null; t = t.parent)
+            for (Transform t = from; t != null; t = t.parent)
             {
                 string name = t.name.ToLowerInvariant();
                 foreach (var p in parts) if (name.Contains(p)) return true;
@@ -408,12 +610,12 @@ namespace StuddingSails
             float radius;
             string src = PoleSection(axisPt, dir, meshes, out centre, out radius);
             // the peg goes in down to the mast axis: no gap even if the mast is thinner or off-centre there
-            pegBack = StandOff + Mathf.Clamp(radius, 0.08f, 0.4f);
+            pegBack = standOff + Mathf.Clamp(radius, 0.08f, 0.4f);
 
             // on the aft side of the mast, port winches to port and starboard ones to starboard, about 0.35 m
             // apart: lower mast pair closest to aft (+-half a step), then the topmast pair, and so on
             Vector3 aft = Vector3.ProjectOnPlane(-ship.forward, dir).normalized;
-            float step = Mathf.Clamp(0.35f / (radius + StandOff) * Mathf.Rad2Deg, 20f, 60f);
+            float step = Mathf.Clamp(spacing / (radius + standOff) * Mathf.Rad2Deg, 20f, 60f);
             float ang = step * (0.5f + slot);
             Vector3 outDir = Quaternion.AngleAxis(ang, dir) * aft;
             bool toStarboard = Vector3.Dot(outDir, ship.right) > 0f;
@@ -422,7 +624,7 @@ namespace StuddingSails
                 ang = -ang;
                 outDir = Quaternion.AngleAxis(ang, dir) * aft;
             }
-            Vector3 c = centre + outDir * (radius + StandOff);
+            Vector3 c = centre + outDir * (radius + standOff);
 
             pos = parent.InverseTransformPoint(c);
             rot = Quaternion.Inverse(parent.rotation) * Quaternion.LookRotation(outDir, dir);
@@ -546,7 +748,7 @@ namespace StuddingSails
         }
 
         private float pegBack = StandOff + 0.2f; // from the winch centre into the mast: down to its axis (set by MastMountPose)
-        private const float PegFront = 0.015f;          // from the winch centre to the cap (snug against the drum)
+        private float pegFront = 0.015f;          // from the winch centre to the cap (snug against the drum or the coil)
         private static readonly Dictionary<int, Mesh> pegMeshes = new Dictionary<int, Mesh>();
 
         /// <summary>
@@ -554,13 +756,14 @@ namespace StuddingSails
         /// winch and past it, ending in a mushroom cap (flat underside, rim, low dome) that would keep the
         /// winch from sliding off. Low-poly, faceted like the game's own pins.
         /// </summary>
-        private static Mesh PegMesh(float back)
+        private static Mesh PegMesh(float back, float front)
         {
-            int key = Mathf.RoundToInt(back * 100f); // one mesh per centimetre of length
+            // one mesh per centimetre of length and millimetre of the part in front of the winch
+            int key = Mathf.RoundToInt(back * 100f) * 1000 + Mathf.RoundToInt(front * 1000f);
             Mesh pegMesh;
             if (pegMeshes.TryGetValue(key, out pegMesh) && pegMesh != null) return pegMesh;
 
-            float L = key / 100f + PegFront;
+            float L = Mathf.RoundToInt(back * 100f) / 100f + Mathf.RoundToInt(front * 1000f) / 1000f;
             // profile (radius, z), tip last; every pair is its own strip, so edges between them stay sharp
             Vector2[] prof =
             {
@@ -629,7 +832,7 @@ namespace StuddingSails
                                                   1f / Mathf.Max(1e-4f, Mathf.Abs(ps.y)),
                                                   1f / Mathf.Max(1e-4f, Mathf.Abs(ps.z)));
 
-            go.AddComponent<MeshFilter>().sharedMesh = PegMesh(pegBack);
+            go.AddComponent<MeshFilter>().sharedMesh = PegMesh(pegBack, pegFront);
             var mr = go.AddComponent<MeshRenderer>();
 
             // the game's spar wood: the yard of a square sail on this mast column (the studding booms use
@@ -760,6 +963,7 @@ namespace StuddingSails
         private Transform fallFrom, fallTo;
         private Transform fallHolder, fallStart;
         private const float DrumRadius = 0.068f; // where the rope leaves the drum (? the cap underside radius)
+        private float fallRadius = DrumRadius;   // where it leaves the winch: the drum, or the rim of the coil
 
         /// <summary>Remembers the ends of the fall (winch drum -> masthead block); it is built when shown.</summary>
         private void AddRope(Transform winchT, Transform ship)
@@ -798,7 +1002,7 @@ namespace StuddingSails
             fallStart.SetParent(fallFrom.parent, false);
             Vector3 toTop = Vector3.ProjectOnPlane(fallTo.position - fallFrom.position, fallFrom.forward);
             Vector3 side = toTop.sqrMagnitude > 1e-6f ? toTop.normalized : fallFrom.up;
-            fallStart.position = fallFrom.position + side * DrumRadius;
+            fallStart.position = fallFrom.position + side * fallRadius;
 
             rope = new GameObject("StuddingWinchFall");
             rope.layer = fallFrom.gameObject.layer;
@@ -1026,6 +1230,7 @@ namespace StuddingSails
                 winch.ShowWinch(any);
                 colOn = !colOn; // ShowWinch switched the collider too: let the check above set it again
                 if (peg != null) peg.gameObject.SetActive(any);
+                if (coil != null) coil.SetActive(any);
                 ShowFall(any);
             }
         }
@@ -1036,6 +1241,7 @@ namespace StuddingSails
             if (mast != null && winches.TryGetValue(mast, out pair) && pair != null && pair[side] == this) pair[side] = null;
             if (winch != null) Destroy(winch.gameObject);
             if (peg != null) Destroy(peg.gameObject);
+            if (coil != null) Destroy(coil);
             ShowFall(false);
             if (controller != null) Destroy(controller.gameObject);
         }

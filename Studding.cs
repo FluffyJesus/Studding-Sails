@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
@@ -105,6 +106,23 @@ namespace StuddingSails
             int fs = Mathf.RoundToInt(foot / FootStep);
             int f = fs == 0 ? 0 : fs + 21;
             return 200f + Mathf.Round(width * 100f) + 1000f * a + 100000f * f;
+        }
+
+        private sealed class Box { internal float Code; }
+        private static readonly ConditionalWeakTable<SaveSailData, Box> kept = new ConditionalWeakTable<SaveSailData, Box>();
+
+        /// <summary>Studding sails of the sail this record was taken from (code as EncodeSave).</summary>
+        internal static void Keep(SaveSailData record, float code)
+        {
+            kept.Remove(record);
+            kept.Add(record, new Box { Code = code });
+        }
+
+        /// <summary>The code kept with this record; for a record from a save made before 1.4, its health.</summary>
+        internal static float Kept(SaveSailData record)
+        {
+            Box b;
+            return kept.TryGetValue(record, out b) ? b.Code : record.health;
         }
 
         internal static bool DecodeSave(float health, out float width, out float arm, out float foot)
@@ -218,6 +236,11 @@ namespace StuddingSails
                 "BOAT medi medium (50),BOAT junk large (70),BOAT junk medium (80),BOAT junk small singleroof(90)",
                 "Comma-separated parts of vanilla boat object names. Their studding sail winch is stacked above the " +
                 "mast's own winches; on any other (modded) boat it is mounted on the mast on a peg. Empty = all boats vanilla.");
+            UseRopeCoil = cfg.Bind("Studding", "UseRopeCoil", true,
+                "On a modded boat, the studding sail control pinned to the mast is a coil of rope on a peg (the model of the " +
+                "mooring rope coil); work it like a winch. Off = a copy of the boat's own winch.");
+            RopeCoilSize = cfg.Bind("Studding", "RopeCoilDiameter", 0.26f,
+                "Diameter (m) of that rope coil.");
             WinchOffsetX = cfg.Bind("Studding", "WinchOffsetX", 0f,
                 "Extra offset of the studding sail winch, local X (if it overlaps something).");
             WinchOffsetY = cfg.Bind("Studding", "WinchOffsetY", 0f,
@@ -266,6 +289,8 @@ namespace StuddingSails
         internal static ConfigEntry<KeyCode> ToggleKey;
         internal static ConfigEntry<bool> UseWinch;
         internal static ConfigEntry<string> VanillaBoats;
+        internal static ConfigEntry<bool> UseRopeCoil;
+        internal static ConfigEntry<float> RopeCoilSize;
         internal static ConfigEntry<float> WinchOffsetX;
         internal static ConfigEntry<float> WinchOffsetY;
         internal static ConfigEntry<float> WinchOffsetZ;
@@ -300,6 +325,11 @@ namespace StuddingSails
         internal static readonly Fixed<float> TriangleSlack = new Fixed<float>(0.4f); // share of the cloth slack the triangle gets
         internal static readonly Fixed<float> WinchGear = new Fixed<float>(2f); // studding sail winch gear ratio, times the vanilla one: twice the turns
         internal static readonly Fixed<bool> VerboseLog = new Fixed<bool>(false);
+
+        internal static void Debug(string s)
+        {
+            if (VerboseLog.Value) Plugin.Log.LogInfo(s);
+        }
 
         private static readonly FieldInfo CurrentBoatField = AccessTools.Field(typeof(GameState), "currentBoat");
         private static readonly FieldInfo LastBoatField = AccessTools.Field(typeof(GameState), "lastBoat");
@@ -562,9 +592,14 @@ namespace StuddingSails
     // ---------------------------------------------------------------- saving
 
     /// <summary>
-    /// Writes the flag into health. Each sail's record is found by its content (mast index, prefab,
-    /// install height, scale), exactly the values vanilla GetData copies from it, so the flag cannot land
+    /// Keeps each sail's studding sails with its record (shipyard rebuilds: leaving the yard or cancelling an
+    /// order builds every sail again from these records). Each sail's record is found by its content (mast index,
+    /// prefab, install height, scale), exactly the values vanilla GetData copies from it, so the flag cannot land
     /// on another sail if some mod adds, removes or reorders records. The vanilla order is only a hint.
+    /// Up to 1.3 the flag went into SaveSailData.health (vanilla writes 100 there and never reads it), which also
+    /// carried it into the save file; since 1.4 the save file has it in the mod data (StuddingSaveFile) and the
+    /// record keeps it in a table on the side. health is still written for now, so a save stays readable after
+    /// going back to 1.3, and still read, for saves made before 1.4.
     /// </summary>
     [HarmonyPatch(typeof(SaveableBoatCustomization), "GetData")]
     internal static class StuddingSaveGetPatch
@@ -604,7 +639,9 @@ namespace StuddingSails
                                                   ", not #" + guess + " (another mod changed the sail list)");
 
                         used[k] = true;
-                        records[k].health = Studding.EncodeSave(Studding.GetWidth(sl), Studding.GetArm(sl), Studding.GetFootShift(sl));
+                        float code = Studding.EncodeSave(Studding.GetWidth(sl), Studding.GetArm(sl), Studding.GetFootShift(sl));
+                        Studding.Keep(records[k], code);
+                        records[k].health = code; // the old place, for 1.3 (see above)
                     }
                 }
             }
@@ -640,7 +677,7 @@ namespace StuddingSails
         private static void Prefix(SaveSailData sailData)
         {
             float w = 1f, arm = -1f, foot = 0f;
-            Studding.PendingFromSave = sailData != null && Studding.DecodeSave(sailData.health, out w, out arm, out foot);
+            Studding.PendingFromSave = sailData != null && Studding.DecodeSave(Studding.Kept(sailData), out w, out arm, out foot);
             Studding.PendingWidth = Studding.PendingFromSave ? w : 1f;
             Studding.PendingArm = Studding.PendingFromSave ? arm : -1f;
             Studding.PendingFoot = Studding.PendingFromSave ? foot : 0f;
@@ -649,6 +686,121 @@ namespace StuddingSails
         private static void Postfix()
         {
             Studding.PendingFromSave = false;
+        }
+    }
+
+    /// <summary>
+    /// The save file: GameState.modData under our GUID, "key=code;..." with the code of EncodeSave and the sail
+    /// found by content (boat sceneIndex : mast orderIndex : prefab : how many of that prefab come before it on
+    /// the mast), as Sail Emblems and Sail Damage keep theirs. Read at the end of loading, after the sails were
+    /// built from the records (which, in a save made before 1.4, already brought the studding sails from health).
+    /// </summary>
+    internal static class StuddingSaveFile
+    {
+        // from the save, not matched to a sail yet (that boat not found yet); written back so nothing is lost
+        private static readonly Dictionary<string, float> pending = new Dictionary<string, float>();
+        private static float retry;
+
+        internal static string SaveKey(Sail sail)
+        {
+            Transform parent = sail.transform.parent;
+            Mast mast = parent != null ? parent.GetComponent<Mast>() : null;
+            SaveableObject boat = sail.GetComponentInParent<SaveableObject>();
+            if (boat == null && sail.shipRigidbody != null) boat = sail.shipRigidbody.GetComponentInParent<SaveableObject>();
+            if (mast == null || boat == null || mast.sails == null) return null;
+            int n = 0;
+            foreach (GameObject go in mast.sails)
+            {
+                if (go == sail.gameObject) break;
+                Sail other = go != null ? go.GetComponent<Sail>() : null;
+                if (other != null && other.prefabIndex == sail.prefabIndex) n++;
+            }
+            return boat.sceneIndex + ":" + mast.orderIndex + ":" + sail.prefabIndex + ":" + n;
+        }
+
+        [HarmonyPatch(typeof(SaveLoadManager), "SaveModData")]
+        private static class SavePatch
+        {
+            private static void Postfix()
+            {
+                try
+                {
+                    var all = new Dictionary<string, float>(pending);
+                    foreach (var m in UnityEngine.Object.FindObjectsOfType<StuddingSailMarker>())
+                    {
+                        Sail sail = m.GetComponent<Sail>();
+                        if (sail == null || !sail.IsInstalled() || !Studding.IsOn(sail)) continue;
+                        string key = SaveKey(sail);
+                        if (key != null) all[key] = Studding.EncodeSave(Studding.GetWidth(sail), Studding.GetArm(sail), Studding.GetFootShift(sail));
+                    }
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var kv in all)
+                    {
+                        if (sb.Length > 0) sb.Append(';');
+                        sb.Append(kv.Key).Append('=').Append(Mathf.RoundToInt(kv.Value).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    if (sb.Length == 0) GameState.modData.Remove(Plugin.GUID);
+                    else GameState.modData[Plugin.GUID] = sb.ToString();
+                    Studding.Debug("[Studding] saved studding sails of " + all.Count + " sails");
+                }
+                catch (Exception e)
+                {
+                    Plugin.Log.LogError("[Studding] saving to the mod data failed: " + e);
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(SaveLoadManager), "LoadModData")]
+        private static class LoadPatch
+        {
+            // vanilla calls it at the very end of LoadGame, when the boats and their sails exist
+            private static void Postfix()
+            {
+                pending.Clear();
+                string data;
+                GameState.modData.TryGetValue(Plugin.GUID, out data);
+                if (!string.IsNullOrEmpty(data))
+                    foreach (string part in data.Split(';'))
+                    {
+                        int eq = part.IndexOf('=');
+                        int code;
+                        if (eq <= 0 || !int.TryParse(part.Substring(eq + 1), System.Globalization.NumberStyles.Integer,
+                                                     System.Globalization.CultureInfo.InvariantCulture, out code)) continue;
+                        pending[part.Substring(0, eq)] = code;
+                    }
+                int n = pending.Count;
+                Apply();
+                Studding.Debug("[Studding] loaded studding sails of " + n + " sails" + (pending.Count > 0 ? ", " + pending.Count + " not found yet" : ""));
+            }
+        }
+
+        private static void Apply()
+        {
+            if (pending.Count == 0) return;
+            foreach (Sail sail in UnityEngine.Object.FindObjectsOfType<Sail>())
+            {
+                if (!sail.IsInstalled()) continue;
+                string key = SaveKey(sail);
+                float code;
+                if (key == null || !pending.TryGetValue(key, out code)) continue;
+                pending.Remove(key);
+                float w, arm, foot;
+                if (!Studding.IsSquare(sail) || !Studding.DecodeSave(code, out w, out arm, out foot)) continue;
+                Studding.Set(sail, true);
+                Studding.SetWidth(sail, w);
+                Studding.SetArm(sail, arm);
+                Studding.SetFootShift(sail, foot);
+            }
+        }
+
+        /// <summary>Every few seconds while some saved studding sails have not found their sail.</summary>
+        internal static void Update()
+        {
+            if (pending.Count == 0 || !GameState.playing) return;
+            retry -= Time.unscaledDeltaTime;
+            if (retry > 0f) return;
+            retry = 5f;
+            Apply();
         }
     }
 

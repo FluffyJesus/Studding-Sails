@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
@@ -11,7 +11,7 @@ namespace StuddingSails
     {
         public const string GUID = "fluffyjesus.sailwind.studdingsails";
         public const string NAME = "Studding Sails";
-        public const string VERSION = "1.3.2";
+        public const string VERSION = "1.4.0";
 
         internal static ManualLogSource Log;
 
@@ -30,6 +30,7 @@ namespace StuddingSails
                 Studding.ToggleDeployed();
 
             StuddingWindow.Update();
+            StuddingSaveFile.Update();
         }
 
         private void OnGUI()
