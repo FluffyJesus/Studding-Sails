@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -1272,7 +1272,8 @@ namespace StuddingSails
             }
 
             curInfo = info;
-            if (root == null) Build(info);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            if (root == null) { Build(info); Slow.Report("build", sw, sail.sailName); }
             if (root == null) return;
 
             if (Time.time >= nextNeighbourCheck)
@@ -1306,13 +1307,22 @@ namespace StuddingSails
             if (!root.activeSelf) root.SetActive(true);
             Visible = true;
 
+            sw = System.Diagnostics.Stopwatch.StartNew();
             TryBakeGeometry();
+            Slow.Report("bake geometry", sw, sail.sailName);
             if (laidVersion != LayoutVersion || Mathf.Abs(laidOutKey - info.Key) > 0.0001f ||
                 Mathf.Abs(laidWidth - Studding.GetWidth(sail)) > 0.001f ||
                 Mathf.Abs(laidArm - Studding.GetArm(sail)) > 0.001f ||
-                (!triangle && Mathf.Abs(laidFoot - Studding.GetFootShift(sail)) > 0.001f)) Layout(info);
+                (!triangle && Mathf.Abs(laidFoot - Studding.GetFootShift(sail)) > 0.001f))
+            {
+                sw = System.Diagnostics.Stopwatch.StartNew();
+                Layout(info);
+                Slow.Report("layout", sw, sail.sailName);
+            }
 
+            sw = System.Diagnostics.Stopwatch.StartNew();
             SyncColor();
+            Slow.Report("colour", sw, sail.sailName);
             tickDeploy[0] = deployL;
             tickDeploy[1] = deployR;
             for (int s = 0; s < 2; s++)
@@ -1333,7 +1343,9 @@ namespace StuddingSails
                 if (sides[s] != null && sides[s].Boom != null && sides[s].Boom.gameObject.activeSelf != boomNeeded)
                     sides[s].Boom.gameObject.SetActive(boomNeeded);
 
+            sw = System.Diagnostics.Stopwatch.StartNew();
             UpdatePanels(tickCanvas, tickDeploy);
+            Slow.Report("panels", sw, sail.sailName);
             for (int s = 0; s < 2; s++) UpdateSwing(s);
 
             for (int s = 0; s < 2; s++)
@@ -2138,6 +2150,18 @@ namespace StuddingSails
                 return pm;
             }
 
+            // Furled: the game keeps the sail's real canvas in ReefEffectAnimUniversal.unfurledMaterial and shows a
+            // placeholder. Up to 1.3.1 the studding sails took the prefab's canvas then, so a sail with another texture
+            // (Shipyard Expansion's, none, Sail Emblems' paint) showed the standard one on its studding sails while
+            // furled (Кэп). Take the saved canvas.
+            Material saved = SavedCanvas();
+            if (saved != null && saved != clothMat && HasTex(saved))
+            {
+                hasColor = saved.HasProperty("_Color");
+                if (hasColor) color = saved.color;
+                return saved;
+            }
+
             Material prefab = PrefabCloth();
             if (furledRend != null && furledRend.sharedMaterial != null && furledRend.sharedMaterial.HasProperty("_Color"))
             {
@@ -2150,6 +2174,20 @@ namespace StuddingSails
                 hasColor = true;
             }
             return prefab;
+        }
+
+        private static readonly HarmonyLib.AccessTools.FieldRef<ReefEffectAnimUniversal, Material> UnfurledMaterial =
+            HarmonyLib.AccessTools.FieldRefAccess<ReefEffectAnimUniversal, Material>("unfurledMaterial");
+
+        // The canvas the game saved away while the sail is furled (null when set, or not a real canvas).
+        private Material SavedCanvas()
+        {
+            var reef = sail != null ? sail.GetComponent<ReefEffectAnimUniversal>() : null;
+            if (reef == null) return null;
+            Material m = UnfurledMaterial(reef);
+            Material empty = Refs.emptyMaterial;
+            if (m == null || empty != null && (m == empty || m.name.StartsWith(empty.name, StringComparison.Ordinal))) return null;
+            return m;
         }
 
         private static bool HasTex(Material m)
@@ -2541,6 +2579,7 @@ namespace StuddingSails
 
             Transform ship = shipGo.transform;
             Vector3 me = ship.InverseTransformPoint(sail.transform.position);
+            Mast myMast = sail.transform.parent != null ? sail.transform.parent.GetComponent<Mast>() : null;
 
             Sail best = null;
             float bestDy = float.MaxValue;
@@ -2549,6 +2588,10 @@ namespace StuddingSails
             {
                 if (other == null || other == sail || !other.gameObject.activeInHierarchy) continue;
                 if (!Studding.IsSquare(other) || Plugin.IsExcludedSail(other)) continue;
+
+                // the same mast or one stacked on it (topmast), not a separate mast standing close by
+                Mast om = other.transform.parent != null ? other.transform.parent.GetComponent<Mast>() : null;
+                if (myMast != null && om != null && !StuddingWinch.SameColumn(myMast, om)) continue;
 
                 Vector3 p = ship.InverseTransformPoint(other.transform.position);
                 float dx = p.x - me.x, dz = p.z - me.z;

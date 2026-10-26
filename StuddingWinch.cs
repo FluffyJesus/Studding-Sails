@@ -1,3 +1,4 @@
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -78,9 +79,36 @@ namespace StuddingSails
             foreach (var w in pair) if (w != null && w.winch != null) yield return w;
         }
 
+        private float nextTry;
+        private bool reportedFail;
+
         private void Ensure()
         {
-            if (winch != null || mast == null) return;
+            if (winch != null || mast == null || Time.time < nextTry) return;
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                BuildWinch();
+                Slow.Report("winch", sw, mast.name);
+            }
+            catch (Exception e)
+            {
+                // never leave a half-built winch behind; try again a bit later
+                if (!reportedFail) Plugin.Log.LogError("[Studding] studding sail winch for mast " + mast.name + " failed: " + e);
+                reportedFail = true;
+                if (winch != null) Destroy(winch.gameObject);
+                if (controller != null) Destroy(controller.gameObject);
+                if (peg != null) Destroy(peg.gameObject);
+                ShowFall(false);
+                winch = null;
+                controller = null;
+                peg = null;
+                nextTry = Time.time + 5f;
+            }
+        }
+
+        private void BuildWinch()
+        {
 
             Transform ship = mast.shipRigidbody != null ? mast.shipRigidbody.transform : null;
             baseMast = ship != null ? BaseMast(mast, ship) : mast;
@@ -91,15 +119,21 @@ namespace StuddingSails
             GPButtonRopeWinch template = null;
             foreach (var m in column) { template = PickTemplate(m); if (template != null) break; }
             if (template == null) template = PickTemplate(mast);
-            if (template == null) return;
+            if (template == null)
+            {
+                if (!reportedFail) Plugin.Log.LogWarning("[Studding] mast " + mast.name + ": no vanilla winch to copy for the studding sail winch");
+                reportedFail = true;
+                nextTry = Time.time + 5f;
+                return;
+            }
 
-            // where: vanilla boats - above the highest winch of this mast column;
-            // modded boats - on the mast itself, on a peg, at the first free spot around it
+            // where: on the mast itself, on a peg, just above the vanilla winches (MastMountPose);
+            // if the mast line looks wrong - stacked above the vanilla winches (WinchPose)
             Transform parent = null;
             Vector3 pos = Vector3.zero;
             Quaternion rot = Quaternion.identity;
-            bool onMast = !IsVanillaBoat(mast) && MastMountPose(template, out parent, out pos, out rot);
-            if (!onMast) WinchPose(mast, template, out parent, out pos, out rot);
+            bool onMast = MastMountPose(template, out parent, out pos, out rot);
+            if (!onMast) WinchPose(template, out parent, out pos, out rot);
 
             // controller first: the winch talks to it
             var cgo = new GameObject("StuddingRopeController");
@@ -114,7 +148,19 @@ namespace StuddingSails
             clone.transform.localRotation = rot;
             clone.transform.localScale = template.transform.localScale;
 
+            // the template may be an unused, switched-off winch slot: the copy must be on, or it never wakes
+            // up (no boat found) and stays invisible
+            if (!clone.activeSelf) clone.SetActive(true);
+            ResetHighlight(clone);
+            // The vanilla winch adds its own highlight outline in Start; the template's one was copied along
+            // with it and stayed behind as a second, stale outline that the outline renderer later picked up
+            // in red (after a teleport). Remove the copies: our winch adds a fresh one in its own Start.
+            foreach (var c in clone.GetComponentsInChildren<Component>(true))
+                if (c != null && c.GetType().Name == "Outline") DestroyImmediate(c);
+
             winch = clone.GetComponent<GPButtonRopeWinch>();
+            winch.enableRedOutline = false;
+            winch.forceDisableRedOutline = true; // never red: nothing about our winch is ever "wrong" to look at
             winch.rotHandle = null; // the VR handle reference was copied from the template; do not share it
             // studding sails are heavier work than a plain rope: a higher gear ratio means more turns of the
             // winch for the same travel (the vanilla winch moves the rope by rotation / 360 / gearRatio), so
@@ -126,13 +172,16 @@ namespace StuddingSails
 
             if (onMast) AddPeg(clone.transform, template);
             AddRope(clone.transform, ship);
+            Plugin.Log.LogInfo("[Studding] " + (side == 0 ? "port" : "starboard") + " studding sail winch for mast " + mast.name +
+                               (onMast ? " pinned to the mast" : " stacked with the mast's winches") +
+                               ", copied from '" + template.name + "' (active " + template.gameObject.activeInHierarchy + ")");
         }
 
         // ------------------------------------------------------------ vanilla or modded boat
 
         /// <summary>
-        /// Boats listed in the VanillaBoats config (comma-separated parts of the boat object name) use the
-        /// stacking placement; any other boat (from mods) gets the winch mounted on the mast.
+        /// Boats listed in the VanillaBoats config (comma-separated parts of the boat object name): there the
+        /// mast line must pass through vanilla winches, or the winch is stacked the old way instead.
         /// An empty list treats every boat as vanilla.
         /// </summary>
         private static bool IsVanillaBoat(Mast mast)
@@ -181,6 +230,44 @@ namespace StuddingSails
             return f;
         }
 
+        /// <summary>
+        /// Two masts form one column (lower mast and topmast) when the upper one stands on the lower one: its
+        /// foot is well up the lower mast (at least 40% of its height) and on its line (within 1 m). Two masts
+        /// side by side - both feet down at the deck - are separate, however close they stand.
+        /// </summary>
+        internal static bool SameColumn(Mast a, Mast b)
+        {
+            if (a == b) return true;
+            if (a == null || b == null) return false;
+            // one stands under the other in the hierarchy (vanilla topmasts are children of their lower mast)
+            if (IsAncestor(a, b) || IsAncestor(b, a)) return true;
+            Transform ship = a.shipRigidbody != null ? a.shipRigidbody.transform : (b.shipRigidbody != null ? b.shipRigidbody.transform : null);
+            Vector3 up = ship != null ? ship.up : Vector3.up;
+            // only upright masts (within ~25 degrees) stack: the line of a bowsprit or a slanted mast (ShipyardExpansion
+            // adds some at 30-40 degrees), run on far enough, can pass any topmast's foot
+            if (Vector3.Dot(Axis(a), up) < 0.9f || Vector3.Dot(Axis(b), up) < 0.9f) return false;
+            Vector3 fa = Foot(a), fb = Foot(b);
+            Mast lo = Vector3.Dot(fa, up) <= Vector3.Dot(fb, up) ? a : b;
+            Mast hi = lo == a ? b : a;
+            Vector3 flo = lo == a ? fa : fb, fhi = lo == a ? fb : fa;
+            float rise = Vector3.Dot(fhi - flo, up);
+            if (rise < 0.4f * Mathf.Max(1f, lo.mastHeight)) return false;
+            return DistToLine(fhi, flo, Axis(lo)) <= 1f;
+        }
+
+        /// <summary>The nearest Mast above this one in the transform hierarchy.</summary>
+        private static Mast ParentMast(Mast m)
+        {
+            Transform t = m != null ? m.transform.parent : null;
+            return t != null ? t.GetComponentInParent<Mast>() : null;
+        }
+
+        private static bool IsAncestor(Mast anc, Mast m)
+        {
+            for (Mast p = ParentMast(m); p != null; p = ParentMast(p)) if (p == anc) return true;
+            return false;
+        }
+
         private static float DistToLine(Vector3 p, Vector3 origin, Vector3 dir)
         {
             Vector3 d = p - origin;
@@ -193,6 +280,11 @@ namespace StuddingSails
         /// </summary>
         private static Mast BaseMast(Mast mast, Transform ship)
         {
+            // the game's own hierarchy first: a topmast sits under its lower mast
+            Mast root = mast;
+            for (Mast p = ParentMast(root); p != null && p != mast; p = ParentMast(p)) root = p;
+            if (root != mast) return root;
+
             Vector3 up = ship.up;
             Mast best = mast;
             Vector3 myFoot = Foot(mast);
@@ -202,7 +294,7 @@ namespace StuddingSails
                 if (m == null || m == mast) continue;
                 float y = Vector3.Dot(Foot(m), up);
                 if (y >= bestY) continue;
-                if (DistToLine(myFoot, Foot(m), Axis(m)) > 1f) continue;
+                if (!SameColumn(mast, m)) continue;
                 bestY = y;
                 best = m;
             }
@@ -221,7 +313,7 @@ namespace StuddingSails
                 if (m == null || m == baseMast) continue;
                 Vector3 f = Foot(m);
                 if (Vector3.Dot(f, up) <= footY) continue;
-                if (DistToLine(f, foot, dir) <= 1f) list.Add(m);
+                if (SameColumn(baseMast, m)) list.Add(m);
             }
             list.Sort((a, b) => a == b ? 0 : a == baseMast ? -1 : b == baseMast ? 1 : Vector3.Dot(Foot(a), up).CompareTo(Vector3.Dot(Foot(b), up)));
             return list;
@@ -291,10 +383,21 @@ namespace StuddingSails
             float footY = Vector3.Dot(foot, up);
 
             // height: a little above the highest vanilla winch standing at this mast (the same for every
-            // studding sail winch of the column, they stand side by side)
-            float maxH = float.MinValue;
-            int near = 0;
-            foreach (var t in AxisWinches(ship, foot, dir, false)) { maxH = Mathf.Max(maxH, Vector3.Dot(t.position, up)); near++; }
+            // studding sail winch of the column, they stand side by side). Every vanilla slot counts, shown or
+            // not (a hidden one may appear when a sail is added), except winches far up in the rig (some masts
+            // keep a slot for another mast spot there): only those within 2 m of the lowest one at this mast.
+            var hs = new List<float>();
+            foreach (var t in AxisWinches(ship, foot, dir, false)) hs.Add(Vector3.Dot(t.position, up));
+            int near = hs.Count;
+            float lowH = float.MaxValue, maxH = float.MinValue;
+            foreach (float y in hs) lowH = Mathf.Min(lowH, y);
+            foreach (float y in hs) if (y <= lowH + 2f) maxH = Mathf.Max(maxH, y);
+            if (IsVanillaBoat(mast) && near == 0)
+            {
+                // the mast line misses the vanilla winches: something is off with this mast, use the old way
+                Plugin.Log.LogWarning("[Studding] mast " + baseMast.name + ": no vanilla winches on its line, stacking the winch");
+                return false;
+            }
             if (maxH == float.MinValue) maxH = Vector3.Dot(template.transform.position, up);
             float h = maxH + 0.3f;
             Vector3 axisPt = foot + dir * ((h - footY) / dirUp);
@@ -725,15 +828,39 @@ namespace StuddingSails
             rope.SetActive(true);
         }
 
+        /// <summary>
+        /// The copy takes over the template's highlight exactly as it was at that moment: if the template was
+        /// lit (looked at, or red while the boat was being moved), the copy stays lit for good, because it never
+        /// gets the "look away" that would switch it off. Switch every outline/highlight component of the copy off;
+        /// the game switches it on again when the winch is looked at.
+        /// </summary>
+        private static void ResetHighlight(GameObject go)
+        {
+            foreach (var c in go.GetComponentsInChildren<Behaviour>(true))
+            {
+                if (c == null) continue;
+                string n = c.GetType().Name.ToLowerInvariant();
+                if (n.Contains("outline") || n.Contains("highlight")) c.enabled = false;
+            }
+        }
+
+        /// <summary>A vanilla winch of the mast to copy: preferably one in use (switched on and shown).</summary>
         private static GPButtonRopeWinch PickTemplate(Mast mast)
         {
             GPButtonRopeWinch[][] sets = { mast.reefWinch, mast.midAngleWinch, mast.leftAngleWinch, mast.rightAngleWinch };
+            GPButtonRopeWinch any = null;
             foreach (var set in sets)
             {
                 if (set == null) continue;
-                foreach (var w in set) if (w != null) return w;
+                foreach (var w in set)
+                {
+                    if (w == null) continue;
+                    if (any == null) any = w;
+                    var r = w.GetComponent<Renderer>();
+                    if (w.gameObject.activeInHierarchy && r != null && r.enabled) return w;
+                }
             }
-            return null;
+            return any;
         }
 
         // ------------------------------------------------------------ stacking (vanilla boats)
@@ -745,19 +872,43 @@ namespace StuddingSails
         /// get a sail later). The new winch copies the orientation of that highest winch, so it faces the
         /// mast the same way.
         /// </summary>
-        private static void WinchPose(Mast mast, GPButtonRopeWinch template, out Transform parent, out Vector3 pos, out Quaternion rot)
+        private void WinchPose(GPButtonRopeWinch template, out Transform parent, out Vector3 pos, out Quaternion rot)
         {
-            Transform ship = mast.shipRigidbody != null ? mast.shipRigidbody.transform : null;
+            Mast col = baseMast != null ? baseMast : mast;
+            Transform ship = col.shipRigidbody != null ? col.shipRigidbody.transform : null;
             Vector3 up = ship != null ? ship.up : Vector3.up;
 
+            // The shown vanilla winches of the column (ours do not count: they share one row). Hidden slots are
+            // skipped, and so is anything well above the lowest winch: some masts carry winches up in the rig
+            // (another mast spot, a mod), and stacking on those hung ours in the air.
+            var shown = new List<Transform>();
+            var all = ColumnWinches(col, ship, false);
+            foreach (Transform t in all)
+            {
+                var tr = t.GetComponent<Renderer>();
+                if (t.gameObject.activeInHierarchy && tr != null && tr.enabled) shown.Add(t);
+            }
+            if (shown.Count == 0) shown.AddRange(all);
+            float low = float.MaxValue;
+            foreach (Transform t in shown) low = Mathf.Min(low, Vector3.Dot(t.position, up));
+            var kept = new List<Transform>();
+            var dropped = new System.Text.StringBuilder();
+            foreach (Transform t in shown)
+            {
+                float h = Vector3.Dot(t.position, up) - low;
+                if (h <= 2f) kept.Add(t);
+                else dropped.Append(" '" + t.name + "' (" + (t.parent != null ? t.parent.name : "-") + ", +" + h.ToString("0.0") + " m)");
+            }
             Transform top = template.transform;
             float topH = float.MinValue;
-
-            foreach (Transform t in ColumnWinches(mast, ship))
+            foreach (Transform t in kept)
             {
                 float h = Vector3.Dot(t.position, up);
                 if (h > topH) { topH = h; top = t; }
             }
+            Plugin.Log.LogInfo("[Studding] winch row for mast " + mast.name + " (column of " + col.name + ", slot " + slot + "): " +
+                all.Count + " vanilla winches near the mast, " + shown.Count + " shown, " + kept.Count + " used" +
+                (dropped.Length > 0 ? "; ignored high up:" + dropped : ""));
 
             // one winch height higher (world bounds of the winch along "up", with a little gap)
             float spacing = 0.35f;
@@ -769,15 +920,43 @@ namespace StuddingSails
                 if (along > 0.05f && along < 1.5f) spacing = along * 1.15f;
             }
 
-            parent = top.parent;
-            Vector3 world = top.position + up * spacing;
+            // Spread around the mast instead of a tall column. No guessing where the mast's axis is: the shown
+            // vanilla winches already sit on the mast's surface all around it, so ours take their spots (and
+            // their facing), lifted into the row above them. Port winches take the most-port spots, starboard
+            // ones the most-starboard; lower mast pair outermost, then the topmast pairs; when spots run out,
+            // a new row starts.
+            var spots = new List<Transform>();
+            foreach (Transform t in kept)
+            {
+                bool dup = false;
+                foreach (var o in spots)
+                {
+                    Vector3 d = t.position - o.position;
+                    d -= up * Vector3.Dot(d, up);
+                    if (d.sqrMagnitude < 0.15f * 0.15f) { dup = true; break; }
+                }
+                if (!dup) spots.Add(t);
+            }
+            if (spots.Count == 0) spots.Add(top);
+            Vector3 right = ship != null ? ship.right : Vector3.right;
+            spots.Sort((x, y) => Vector3.Dot(x.position, right).CompareTo(Vector3.Dot(y.position, right)));
+
+            int n = spots.Count;
+            int perSide = Mathf.Max(1, n / 2);
+            int idx = slot % perSide;
+            int row = slot / perSide;
+            if (n == 1) row = slot * 2 + side; // one spot only: port and starboard take turns upwards
+            Transform spot = side == 0 ? spots[idx] : spots[n - 1 - idx];
+
+            Vector3 world = spot.position + up * (Vector3.Dot(top.position - spot.position, up) + spacing * (1 + row));
+            parent = spot.parent;
             pos = parent != null ? parent.InverseTransformPoint(world) : world;
-            rot = top.localRotation;
+            rot = spot.localRotation;
             pos += new Vector3(Studding.WinchOffsetX.Value, Studding.WinchOffsetY.Value, Studding.WinchOffsetZ.Value);
         }
 
         /// <summary>All winches (vanilla slots and ours) of the masts standing where this mast stands.</summary>
-        private static List<Transform> ColumnWinches(Mast mast, Transform ship)
+        private static List<Transform> ColumnWinches(Mast mast, Transform ship, bool ours = true)
         {
             var list = new List<Transform>();
             Vector3 me = ship != null ? ship.InverseTransformPoint(mast.transform.position) : mast.transform.position;
@@ -786,9 +965,9 @@ namespace StuddingSails
             foreach (Mast m in masts)
             {
                 if (m == null) continue;
-                Vector3 p = ship != null ? ship.InverseTransformPoint(m.transform.position) : m.transform.position;
-                float dx = p.x - me.x, dz = p.z - me.z;
-                if (dx * dx + dz * dz > 1.5f * 1.5f) continue;
+                // only this mast and the masts stacked on it (topmasts): a separate mast standing right next to
+                // it (ShipyardExpansion puts some close together) has its own winches and its own stack
+                if (!SameColumn(mast, m)) continue;
 
                 GPButtonRopeWinch[][] sets = { m.reefWinch, m.midAngleWinch, m.leftAngleWinch, m.rightAngleWinch };
                 foreach (var set in sets)
@@ -805,14 +984,29 @@ namespace StuddingSails
                     }
                 }
 
-                foreach (var sw in OursOn(m)) list.Add(sw.winch.transform);
+                if (ours) foreach (var sw in OursOn(m)) list.Add(sw.winch.transform);
             }
             return list;
         }
 
+        private Collider winchCol;
+        private bool colOn = true;
+
         private void Update()
         {
-            if (winch == null || Time.time < nextCheck) return;
+            if (winch == null) return;
+
+            // The winch needs its collider to be cranked, but the shipyard checks every collider on the boat
+            // against the sails ("a sail is obstructed", red outline on our winches): no collider at the shipyard
+            if (winchCol == null) winchCol = winch.GetComponent<Collider>();
+            bool wantCol = needed && GameState.currentShipyard == null;
+            if (winchCol != null && (winchCol.enabled != wantCol || colOn != wantCol))
+            {
+                winchCol.enabled = wantCol;
+                colOn = wantCol;
+            }
+
+            if (Time.time < nextCheck) return;
             nextCheck = Time.time + 1f;
 
             // show the winch only while some sail of this mast has studding sails
@@ -830,6 +1024,7 @@ namespace StuddingSails
             {
                 needed = any;
                 winch.ShowWinch(any);
+                colOn = !colOn; // ShowWinch switched the collider too: let the check above set it again
                 if (peg != null) peg.gameObject.SetActive(any);
                 ShowFall(any);
             }

@@ -1,4 +1,4 @@
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
@@ -11,7 +11,7 @@ namespace StuddingSails
     {
         public const string GUID = "fluffyjesus.sailwind.studdingsails";
         public const string NAME = "Studding Sails";
-        public const string VERSION = "1.3.1";
+        public const string VERSION = "1.3.2";
 
         internal static ManualLogSource Log;
 
@@ -50,6 +50,16 @@ namespace StuddingSails
             if (n.Contains("junk")) return true;
 
             return false;
+        }
+    }
+
+    /// <summary>Timing probe: with VerboseLog on, logs any step of a studding rig that takes 3 ms or more (for reports from slow machines).</summary>
+    internal static class Slow
+    {
+        internal static void Report(string what, System.Diagnostics.Stopwatch sw, string who)
+        {
+            double ms = sw.Elapsed.TotalMilliseconds;
+            if (ms >= 3.0 && Studding.VerboseLog != null && Studding.VerboseLog.Value) Plugin.Log.LogInfo("[Studding] slow: " + what + " " + who + " " + ms.ToString("F1") + " ms at frame " + Time.frameCount);
         }
     }
 }
